@@ -1,760 +1,591 @@
 #pragma once
 
-#include <algorithm>
-#include <array>
-#include <cassert>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <fstream>
-#include <ios>
 #include <limits>
 #include <memory>
-#include <stdexcept>
-#include <utility>
+#include <optional>
 #include <vector>
 
-#include "rabitqlib/defines.hpp"
-#include "rabitqlib/fastscan/fastscan.hpp"
-#include "rabitqlib/index/estimator.hpp"
+#include "rabitqlib/attribute/types.hpp"  // IWYU pragma: export
+#include "rabitqlib/core/metric.hpp"  // IWYU pragma: export
+#include "rabitqlib/core/types.hpp"   // IWYU pragma: export
 #include "rabitqlib/index/ivf/cluster.hpp"
-#include "rabitqlib/index/ivf/initializer.hpp"
-#include "rabitqlib/index/query.hpp"
-#include "rabitqlib/quantization/data_layout.hpp"
-#include "rabitqlib/quantization/rabitq.hpp"
-#include "rabitqlib/utils/buffer.hpp"
+#include "rabitqlib/index/ivf/types.hpp"  // IWYU pragma: export
+#include "rabitqlib/index/types.hpp"      // IWYU pragma: export
 #include "rabitqlib/utils/memory.hpp"
-#include "rabitqlib/utils/path.hpp"
-#include "rabitqlib/utils/rotator.hpp"
-#include "rabitqlib/utils/space.hpp"
-#include "rabitqlib/utils/tools.hpp"
+
+namespace rabitqlib {
+template <typename T>
+class Rotator;
+template <typename T>
+class SplitBatchQuery;
+namespace buffer {
+template <typename T>
+class SearchBuffer;
+}
+namespace rabitqkmeans {
+struct RaBitQKMeansParameters;
+}
+}  // namespace rabitqlib
 
 namespace rabitqlib::ivf {
-namespace detail {
-void insert_candidates(buffer::SearchBuffer<float>&, const PID*, const float*, size_t);
-}  // namespace detail
+class Initializer;
 
 class IVF {
    private:
+    friend struct IvfTestAccess;
+
     using ByteStorage =
         std::vector<std::byte, memory::AlignedAllocator<std::byte, 64, true>>;
     using FloatStorage = std::vector<float, memory::AlignedAllocator<float, 64, true>>;
     using IdStorage = std::vector<PID, memory::AlignedAllocator<PID, 64, true>>;
 
-    std::unique_ptr<Initializer> initer_;            // initializer for candidate clusters
-    ByteStorage batch_storage_;                      // 1-bit code and factors
-    ByteStorage ex_storage_;                         // extra-bit codes and packed factors
-    FloatStorage raw_storage_;                       // original vectors for raw reranking
-    IdStorage id_storage_;                           // point IDs organized by cluster
-    size_t num_ = 0;                                 // num of data points
-    size_t dim_ = 0;                                 // dimension of data points
-    size_t padded_dim_ = 0;                          // dimension after padding
-    size_t num_cluster_ = 0;                         // num of centroids (clusters)
-    bool raw_reranking_ = false;                     // raw vectors replace extra-bit codes
-    bool ready_ = false;                             // construction or loading completed
-    size_t ex_bits_ = 0;                             // total bits = ex_bits_ + 1
-    RotatorType type_ = RotatorType::FhtKacRotator;  // type of rotator
-    std::unique_ptr<Rotator<float>> rotator_;        // Data Rotator
-    std::vector<Cluster> cluster_lst_;               // List of clusters in ivf
-    MetricType metric_type_ = rabitqlib::METRIC_L2;  // metric type
+    // One cluster's own storage, independent of every other cluster's.
+    class ClusterStorage {
+       public:
+        explicit ClusterStorage(bool raw_reranking) : raw_reranking_(raw_reranking) {}
+
+        ByteStorage batch_storage;  // 1-bit code and factors
+        ByteStorage ex_storage;     // extra-bit codes and packed factors
+        FloatStorage raw_storage;   // original vectors for raw reranking
+        IdStorage id_storage;       // point IDs of this cluster
+
+        [[nodiscard]] char* batch_data() {
+            return reinterpret_cast<char*>(batch_storage.data());
+        }
+
+        [[nodiscard]] const char* batch_data() const {
+            return reinterpret_cast<const char*>(batch_storage.data());
+        }
+
+        // Raw vectors with raw reranking, extra-bit codes otherwise.
+        [[nodiscard]] char* rerank_data() {
+            return raw_reranking_ ? reinterpret_cast<char*>(raw_storage.data())
+                                  : reinterpret_cast<char*>(ex_storage.data());
+        }
+
+        [[nodiscard]] const char* rerank_data() const {
+            return raw_reranking_ ? reinterpret_cast<const char*>(raw_storage.data())
+                                  : reinterpret_cast<const char*>(ex_storage.data());
+        }
+
+        [[nodiscard]] PID* ids() { return id_storage.data(); }
+
+        [[nodiscard]] const PID* ids() const { return id_storage.data(); }
+
+       private:
+        bool raw_reranking_;  // raw vectors replace extra-bit codes
+    };
+
+    InitializerType initializer_type_ = InitializerType::Auto;
+    std::unique_ptr<Initializer> initializer_;  // initializer for candidate clusters
+    // Flat centroid norms for routing in add; computed on first use, cleared with
+    // the initializer.
+    std::vector<double> flat_centroid_norms_;
+    std::vector<ClusterStorage> cluster_storage_;  // one entry per cluster
+    size_t max_elements_ = 0;  // Logical capacity; construct fills it, add grows it.
+    size_t num_removed_ = 0;   // Recovered from removal markers when loading.
+    size_t dim_ = 0;
+    size_t padded_dim_ = 0;
+    size_t num_clusters_ = 0;
+    bool raw_reranking_ = false;  // raw vectors replace extra-bit codes
+    bool ready_ = false;          // centroids set, construction or loading completed
+    size_t ex_bits_ = 0;          // total bits = ex_bits_ + 1; 0 with raw reranking
+    RotatorType rotator_type_ = RotatorType::FhtKacRotator;
+    std::unique_ptr<Rotator<float>> rotator_;
+    std::vector<Cluster> clusters_;
+    MetricType metric_type_ = METRIC_L2;
     float (*ip_func_)(const float*, const uint8_t*, size_t) = nullptr;
 
     static constexpr uint64_t kRawFormatMagic = 0x3157415251464252ULL;
     static constexpr uint32_t kRawFormatVersion = 1;
+    static constexpr uint64_t kFormatMagic = 0x3158444951424152ULL;  // "RABQIDX1"
+    static constexpr uint32_t kFormatVersion = 2;
 
-    void
-    quantize_cluster(Cluster&, const std::vector<PID>&, const float*, const float*, float*, const quant::RabitqConfig&);
+    void quantize_cluster(
+        Cluster& cluster,
+        const std::vector<PID>& point_ids,
+        const float* data,
+        const float* centroid,
+        float* rotated_centroid,
+        float* rotated_data,
+        const quant::RabitqConfig& config
+    );
 
-    [[nodiscard]] size_t ids_bytes() const { return sizeof(PID) * num_; }
+    void extend_cluster(
+        const Cluster& old_cluster,
+        const std::vector<PID>& rows,
+        const float* data,
+        const float* rotated_centroid,
+        PID first_pid,
+        char* batch_dst,
+        char* rerank_dst,
+        PID* ids_dst,
+        char* tail_dst,
+        const quant::RabitqConfig& config
+    ) const;
 
-    // get num of bytes used for 1-bit code and corresponding factors
-    [[nodiscard]] size_t batch_data_bytes(const std::vector<size_t>& cluster_sizes) const {
-        assert(cluster_sizes.size() == num_cluster_);  // num of clusters
-        size_t total_blocks = 0;
-        for (auto size : cluster_sizes) {
-            total_blocks += div_round_up(size, fastscan::kBatchSize);
-        }
-        return total_blocks * BatchDataMap<float>::data_bytes(padded_dim_);
+    // True if `num_points` points cannot be addressed by the storage size computations
+    [[nodiscard]] bool exceeds_storage(size_t num_points) const;
+
+    [[nodiscard]] static size_t ids_bytes(size_t cluster_size) {
+        return sizeof(PID) * cluster_size;
     }
 
-    [[nodiscard]] size_t rerank_vector_bytes() const {
-        return raw_reranking_ ? sizeof(float) * dim_
-                              : ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
-    }
+    // Bytes of one FastScan batch of 1-bit codes and factors
+    [[nodiscard]] inline size_t batch_bytes() const;
 
-    [[nodiscard]] size_t ex_data_bytes() const { return rerank_vector_bytes() * num_; }
+    // Bytes of the whole batches holding `cluster_size` points' 1-bit codes and factors
+    [[nodiscard]] size_t batch_data_bytes(size_t cluster_size) const;
 
-    [[nodiscard]] char* batch_data() {
-        return reinterpret_cast<char*>(batch_storage_.data());
-    }
+    // True if points carry extra-bit codes or raw vectors for reranking
+    [[nodiscard]] bool has_rerank_data() const { return raw_reranking_ || ex_bits_ > 0; }
 
-    [[nodiscard]] const char* batch_data() const {
-        return reinterpret_cast<const char*>(batch_storage_.data());
-    }
+    [[nodiscard]] inline size_t rerank_vector_bytes() const;
 
-    [[nodiscard]] char* ex_data() {
-        return raw_reranking_ ? reinterpret_cast<char*>(raw_storage_.data())
-                              : reinterpret_cast<char*>(ex_storage_.data());
-    }
+    [[nodiscard]] inline size_t rerank_data_bytes(size_t cluster_size) const;
 
-    [[nodiscard]] const char* ex_data() const {
-        return raw_reranking_ ? reinterpret_cast<const char*>(raw_storage_.data())
-                              : reinterpret_cast<const char*>(ex_storage_.data());
-    }
+    // Size every buffer of a cluster's storage for `num_points` points
+    void resize_storage(ClusterStorage& cs, size_t num_points) const;
 
-    [[nodiscard]] PID* ids() { return id_storage_.data(); }
+    void reserve_storage(ClusterStorage& cs, size_t num_points) const;
 
-    [[nodiscard]] const PID* ids() const { return id_storage_.data(); }
+    [[nodiscard]] bool has_capacity(const ClusterStorage& cs, size_t num_points) const;
 
-    void allocate_memory(const std::vector<size_t>&);
+    // Validate the settings both constructors share and derive padded_dim_
+    void configure(size_t total_bits);
 
-    void init_clusters(const std::vector<size_t>&);
+    [[nodiscard]] std::unique_ptr<Initializer> make_initializer() const;
 
-    void free_memory() {
-        initer_.reset();
-        ByteStorage().swap(batch_storage_);
-        ByteStorage().swap(ex_storage_);
-        FloatStorage().swap(raw_storage_);
-        IdStorage().swap(id_storage_);
-    }
+    // Reset the index and allocate a new initializer and per-cluster storage
+    void allocate_storage(const std::vector<size_t>& cluster_sizes);
 
-    void swap(IVF& other) noexcept {
-        using std::swap;
-        swap(initer_, other.initer_);
-        swap(batch_storage_, other.batch_storage_);
-        swap(ex_storage_, other.ex_storage_);
-        swap(raw_storage_, other.raw_storage_);
-        swap(id_storage_, other.id_storage_);
-        swap(num_, other.num_);
-        swap(dim_, other.dim_);
-        swap(padded_dim_, other.padded_dim_);
-        swap(num_cluster_, other.num_cluster_);
-        swap(raw_reranking_, other.raw_reranking_);
-        swap(ready_, other.ready_);
-        swap(ex_bits_, other.ex_bits_);
-        swap(type_, other.type_);
-        swap(rotator_, other.rotator_);
-        swap(cluster_lst_, other.cluster_lst_);
-        swap(metric_type_, other.metric_type_);
-        swap(ip_func_, other.ip_func_);
-    }
+    // Create the non-owning cluster views over the allocated storage
+    void create_cluster_views(const std::vector<size_t>& cluster_sizes);
 
-    void
-    search_cluster(const Cluster&, const SplitBatchQuery<float>&, buffer::SearchBuffer<float>&, bool, const float*)
-        const;
+    void free_storage();
 
-    void
-    scan_one_batch(const char* batch_data, const char* ex_data, const PID* ids, const SplitBatchQuery<float>& q_obj, buffer::SearchBuffer<float>& knns, size_t num_points, bool, const float*)
-        const;
+    void swap(IVF& other) noexcept;
+
+    // Optional predicate context for one query. base_attr is a row-major
+    // [num_stored_points(), attr_dim] table, so every stored ID can index it
+    // even after remove(). query_attr points at one expanded row of qstride
+    // int32 values: an equality column holds one target, a range column holds
+    // a [lo, hi] pair. A null layout means all columns are equality
+    // (qstride == attr_dim). A null gate disables filtering entirely.
+    struct AttributeGate {
+        const uint32_t* base_attr;
+        const int32_t* query_attr;
+        size_t attr_dim;
+        const attribute::AttributeKind* layout;
+        size_t qstride;
+    };
+
+    [[nodiscard]] bool attribute_allowed(const AttributeGate* gate, PID id) const;
+
+    // Both search and search_batch funnel here, with a null gate for the
+    // unfiltered entry points. Cluster routing and distance estimation are
+    // unchanged; the gate only rejects points at result-pool insertion.
+    void search_impl(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        bool use_hacc,
+        const AttributeGate* gate
+    ) const;
+
+    // A non-null base_attr enables one predicate gate per query, sliced as
+    // query_attrs + i * qstride. A null layout is an all-equality gate with
+    // qstride == attr_dim.
+    void search_batch_impl(
+        const float* queries,
+        size_t num_queries,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        std::optional<bool> use_hacc,
+        size_t num_threads,
+        const uint32_t* base_attr,
+        const int32_t* query_attrs,
+        size_t attr_dim,
+        const attribute::AttributeKind* layout,
+        size_t qstride
+    ) const;
+
+    inline void search_cluster(
+        const Cluster& cluster,
+        const SplitBatchQuery<float>& query_wrapper,
+        buffer::SearchBuffer<float>& result_pool,
+        bool use_hacc,
+        const float* query,
+        const AttributeGate* gate
+    ) const;
+
+    inline void scan_one_batch(
+        const char* batch_data,
+        const char* rerank_data,
+        const PID* ids,
+        const SplitBatchQuery<float>& query_wrapper,
+        buffer::SearchBuffer<float>& result_pool,
+        size_t batch_size,
+        bool use_hacc,
+        const float* query,
+        const AttributeGate* gate
+    ) const;
+
+    inline void validate_search(
+        const float* query, size_t k, size_t nprobe, const PID* result_ids
+    ) const;
+
+    // Write the index file, and any initializer sidecar, at exactly this path.
+    void write_file(const char* filename) const;
 
    public:
-    explicit IVF() = default;
+    explicit IVF() noexcept;
+    // dim is the original input dimension; total_bits is 1-9 for quantized
+    // storage (including the sign bit), or 32 for raw-vector reranking.
     explicit IVF(
-        size_t,
-        size_t,
-        size_t,
-        size_t,
-        MetricType metric_type = rabitqlib::METRIC_L2,
-        RotatorType type = RotatorType::FhtKacRotator
+        size_t num_points,
+        size_t dim,
+        size_t num_clusters,
+        size_t total_bits,
+        MetricType metric_type = METRIC_L2,
+        RotatorType rotator_type = RotatorType::FhtKacRotator,
+        InitializerType initializer_type = InitializerType::Auto
+    );
+
+    /**
+     * @brief Create an empty index to fill with train or set_centroids, then add.
+     *
+     * The index starts with no point storage. construct rebuilds an index from
+     * max_elements() rows, so it fails here until add has stored points.
+     * Pass the seed: four arguments such as (dim, num_clusters, 4, METRIC_IP)
+     * select the point-count constructor instead, which converts the metric to
+     * total_bits.
+     *
+     * @param dim Original input dimension
+     * @param num_clusters Number of centroids that train or set_centroids provides
+     * @param total_bits 1-9 for quantized storage (including the sign bit), or 32 for
+     * raw-vector reranking
+     * @param metric_type Distance metric
+     * @param seed Rotation seed
+     * @param rotator_type Rotation type
+     * @param initializer_type Centroid routing strategy
+     */
+    explicit IVF(
+        size_t dim,
+        size_t num_clusters,
+        size_t total_bits,
+        MetricType metric_type,
+        uint32_t seed,
+        RotatorType rotator_type = RotatorType::FhtKacRotator,
+        InitializerType initializer_type = InitializerType::Auto
     );
 
     ~IVF();
 
-    [[nodiscard]] size_t max_elements() const { return num_; }
+    // Logical capacity, including slots occupied by removed points. add grows it.
+    [[nodiscard]] size_t max_elements() const { return max_elements_; }
+    // Unbuilt indexes have no stored or searchable points.
+    [[nodiscard]] size_t num_points() const {
+        return ready_ ? max_elements_ - num_removed_ : 0;
+    }
+    [[nodiscard]] size_t num_stored_points() const { return ready_ ? max_elements_ : 0; }
     [[nodiscard]] size_t dimension() const { return dim_; }
     [[nodiscard]] size_t nbits() const { return raw_reranking_ ? 32 : ex_bits_ + 1; }
     [[nodiscard]] MetricType metric_type() const { return metric_type_; }
-    [[nodiscard]] RotatorType rotator_type() const { return type_; }
+    [[nodiscard]] RotatorType rotator_type() const { return rotator_type_; }
+    [[nodiscard]] InitializerType initializer_type() const { return initializer_type_; }
+    // Centroids are set, by train, set_centroids, construct or load.
+    [[nodiscard]] bool is_trained() const { return ready_; }
 
-    void construct(const float*, const float*, const PID*, bool, size_t);
+    /**
+     * @brief Train num_clusters() centroids on `data` and set them as set_centroids does.
+     *
+     * Uses RaBitQKMeans up to kMaxRaBitQKMeansClusters clusters, and QGKMeans with the
+     * fields the two parameter types share and default graph parameters above that.
+     * Only centroids are trained: points are not assigned until add. Requires a
+     * configured index without stored points that was not created with a point
+     * count; the index is unchanged if this throws.
+     *
+     * @param num_points Number of training points, at least num_clusters()
+     * @param data Training points (num_points * dim)
+     * @param cp Clustering parameters, for example default_training_parameters();
+     * cp.num_threads also limits building the centroid initializer
+     */
+    void train(
+        size_t num_points, const float* data, const rabitqkmeans::RaBitQKMeansParameters& cp
+    );
 
-    void save(const char*) const;
+    /**
+     * @brief Replace the centroids of an index without stored points.
+     *
+     * Builds the centroid initializer and empty clusters, so the index can add points.
+     * An index created with a point count is built by construct instead, so this
+     * throws std::logic_error for it. The index is unchanged if this throws.
+     *
+     * @param centroids Centroid vectors (num_clusters() * dim)
+     * @param num_threads Threads used to build the centroid initializer
+     */
+    void set_centroids(
+        const float* centroids, size_t num_threads = std::numeric_limits<size_t>::max()
+    );
 
-    void load(const char*);
+    /**
+     * @brief Quantize every point into its cluster and build the centroid initializer.
+     *
+     * Replaces any existing contents of the index.
+     *
+     * @param data Data points (max_elements() * dim)
+     * @param centroids Centroid vectors (num_clusters() * dim)
+     * @param cluster_ids Cluster ID of each data point
+     * @param fast_quantization Select fixed-scale extra-bit quantization instead of exact
+     * scale search, trading quantization accuracy for speed; one-bit and raw storage are
+     * unaffected
+     * @param num_threads Threads used for quantization and initializer construction
+     */
+    void construct(
+        const float* data,
+        const float* centroids,
+        const PID* cluster_ids,
+        bool fast_quantization = false,
+        size_t num_threads = std::numeric_limits<size_t>::max()
+    );
+
+    /**
+     * @brief Append points to a trained, constructed or loaded index.
+     *
+     * Points are quantized against the centroids and rotator the index already holds, so
+     * the centroids never move: recall can degrade if the added data drifts away from the
+     * data the centroids were trained on. Point `i` of `data` receives PID
+     * `num_stored_points() + i`. The index is unchanged if this throws.
+     *
+     * Only clusters that receive points are touched. Each one is rebuilt next to its old
+     * storage, so a call needs extra memory for, and takes time proportional to, those
+     * clusters plus `num_points`; prefer a few large calls to many small ones. A cluster
+     * with enough capacity from `reserve` grows in place instead. `construct` expects
+     * `max_elements()` rows afterwards.
+     * Not safe to call while another thread searches, adds or removes.
+     *
+     * @param data New points (num_points * dim)
+     * @param num_points Number of new points
+     * @param cluster_ids Cluster of each new point, or nullptr to route each point to its
+     * nearest centroid under the index's initializer. Flat routing assigns exactly, so
+     * near-ties may resolve differently from a query's float scan
+     * @param fast_quantization Use fixed-scale extra-bit quantization for speed at a
+     * possible loss of accuracy; has no effect on one-bit or raw storage
+     * @param num_threads Threads used for routing and quantization
+     */
+    void add(
+        const float* data,
+        size_t num_points,
+        const PID* cluster_ids = nullptr,
+        bool fast_quantization = false,
+        size_t num_threads = std::numeric_limits<size_t>::max()
+    );
+
+    /**
+     * @brief Preallocate room for a cluster to hold `num_points` points.
+     *
+     * Later `add` calls grow the cluster in place, without copying it, until it holds more
+     * than `num_points`. Does nothing if the cluster already has that capacity. Reserved
+     * capacity is not saved: a loaded index has none. The index is unchanged if this
+     * throws. Not safe to call while another thread searches, adds or removes.
+     *
+     * @param cluster_id Cluster to grow
+     * @param num_points Total number of points the cluster can hold, including its
+     * current ones
+     */
+    void reserve(PID cluster_id, size_t num_points);
+
+    /**
+     * @brief Exclude points from all later search results.
+     *
+     * A removed point stays in num_stored_points() and occupies capacity, but no longer
+     * counts in num_points(). Search may
+     * return fewer than k results (unfilled slots use kPidMax). Removal is stored in the
+     * index, so it survives save and load, and is idempotent. Removed points cannot be
+     * restored. Not safe to call while another thread searches or adds.
+     *
+     * @param ids_to_remove PIDs to remove
+     * @param num_points Number of PIDs
+     * @return Number of points newly removed
+     */
+    size_t remove(const PID* ids_to_remove, size_t num_points);
+
+    // Requires at least one stored point; a trained index must add points first.
+    void save(const char* filename) const;
+
+    void load(const char* filename);
 
     // Automatically use HACC for 4-9 quantized bits; use standard FastScan otherwise.
-    void search(const float*, size_t, size_t, PID*, float* = nullptr) const;
+    // Distances estimate squared L2 or 1 - dot according to the index metric.
+    // k may exceed the point count; slots without a result get kPidMax and +inf.
+    void search(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances = nullptr
+    ) const;
 
-    void search(const float*, size_t, size_t, PID*, bool) const;
+    void search(
+        const float* query, size_t k, size_t nprobe, PID* result_ids, bool use_hacc
+    ) const;
 
-    void search(const float*, size_t, size_t, PID*, float*, bool) const;
+    void search(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        bool use_hacc
+    ) const;
 
-    [[nodiscard]] size_t padded_dim() const { return this->padded_dim_; }
+    /**
+     * Search contiguous row-major queries using at most num_threads workers.
+     * queries contains num_queries * dimension() floats. result_ids and optional
+     * distances each hold num_queries * k elements. Empty batches do no work.
+     * use_hacc defaults to the same automatic policy as search().
+     * Input and output buffers must not overlap. Concurrent calls are safe if
+     * the index is not being modified and their output buffers are separate.
+     */
+    void search_batch(
+        const float* queries,
+        size_t num_queries,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances = nullptr,
+        std::optional<bool> use_hacc = std::nullopt,
+        size_t num_threads = 1
+    ) const;
 
-    [[nodiscard]] size_t num_clusters() const { return this->num_cluster_; }
+    /**
+     * @brief Search keeping only points whose attributes equal the targets.
+     *
+     * base_attr is a row-major [num_stored_points(), attr_dim] uint32 table
+     * and query_attr holds attr_dim targets. Targets must be non-negative: the APR
+     * encoder cannot rotate a wildcard (-1) probe, so a wildcard here would
+     * disagree with the soft filter. Mismatching points still take part in
+     * cluster routing and distance estimation but never enter the result pool.
+     * Attribute tables stay outside the index file.
+     *
+     * nprobe is the cluster-selection budget, not an oversampling budget; to
+     * collect more candidates pass a larger k. Fewer than k results are padded
+     * with kPidMax and +inf, as in the unfiltered overloads.
+     */
+    void search(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        const uint32_t* base_attr,
+        const int32_t* query_attr,
+        size_t attr_dim
+    ) const;
+
+    /**
+     * @brief Predicate-filtered search with an explicit per-attribute layout.
+     *
+     * layout[a] selects kEquality (one int32 target) or kRange (a [lo, hi]
+     * pair), so query_attr holds query_stride(layout, attr_dim) values while
+     * base_attr stays [num_stored_points(), attr_dim]. All other semantics,
+     * including the result-pool-only gate and padding, match the equality
+     * overload. Negative values (including -1 wildcards), inverted or negative
+     * range bounds and unknown layout entries are rejected. The offline HAPR
+     * encoder encodes each range query at its interval centre.
+     */
+    void search(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        const uint32_t* base_attr,
+        const int32_t* query_attr,
+        size_t attr_dim,
+        const attribute::AttributeKind* layout
+    ) const;
+
+    void search(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        bool use_hacc,
+        const uint32_t* base_attr,
+        const int32_t* query_attr,
+        size_t attr_dim
+    ) const;
+
+    // use_hacc variant of the predicate-filtered single-query search.
+    void search(
+        const float* query,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        bool use_hacc,
+        const uint32_t* base_attr,
+        const int32_t* query_attr,
+        size_t attr_dim,
+        const attribute::AttributeKind* layout
+    ) const;
+
+    /**
+     * @brief Batched equality-filtered search, one gate per query row.
+     *
+     * query_attrs is a row-major [num_queries, attr_dim] int32 table; every
+     * target must be non-negative. use_hacc and num_threads follow the
+     * unfiltered search_batch defaults.
+     */
+    void search_batch(
+        const float* queries,
+        size_t num_queries,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        const uint32_t* base_attr,
+        const int32_t* query_attrs,
+        size_t attr_dim,
+        std::optional<bool> use_hacc = std::nullopt,
+        size_t num_threads = 1
+    ) const;
+
+    /**
+     * @brief Batched predicate-filtered search, one gate per expanded row.
+     *
+     * query_attrs is a row-major [num_queries, qstride] int32 table, sliced as
+     * query_attrs + i * qstride, where qstride is derived from layout.
+     * Validation, use_hacc and num_threads follow the equality-filtered batch
+     * overload; a null layout is not accepted by this overload.
+     */
+    void search_batch(
+        const float* queries,
+        size_t num_queries,
+        size_t k,
+        size_t nprobe,
+        PID* result_ids,
+        float* distances,
+        const uint32_t* base_attr,
+        const int32_t* query_attrs,
+        size_t attr_dim,
+        const attribute::AttributeKind* layout,
+        std::optional<bool> use_hacc = std::nullopt,
+        size_t num_threads = 1
+    ) const;
+
+    [[nodiscard]] size_t padded_dim() const { return padded_dim_; }
+
+    [[nodiscard]] size_t num_clusters() const { return num_clusters_; }
 };
 
-inline IVF::IVF(
-    size_t n,
-    size_t dim,
-    size_t cluster_num,
-    size_t bits,
-    MetricType metric_type,
-    RotatorType type
-)
-    : num_(n)
-    , dim_(dim)
-    , padded_dim_(dim)
-    , num_cluster_(cluster_num)
-    , raw_reranking_(bits == 32)
-    , ex_bits_(bits == 32 ? 0 : bits - 1)
-    , type_(type)
-    , metric_type_(metric_type) {
-    validate_metric_type(metric_type);
-    if ((bits < 1 || bits > 9) && bits != 32) {
-        throw std::invalid_argument("IVF bits must be in [1, 9] or 32 for raw reranking");
-    };
-    if (n == 0 || n > buffer::kSearchBufferMaxPointCount) {
-        throw std::invalid_argument("IVF point count exceeds the supported ID range");
-    }
-    if (cluster_num == 0 || cluster_num > buffer::kSearchBufferMaxPointCount) {
-        throw std::invalid_argument("IVF cluster count exceeds the supported ID range");
-    }
-    if (dim == 0 || dim > (std::numeric_limits<size_t>::max() / 32) - 64) {
-        throw std::invalid_argument("IVF dimension is invalid or too large");
-    }
-    padded_dim_ = round_up_to_multiple(dim_, 64);
-    const size_t max_size = std::numeric_limits<size_t>::max();
-    const size_t batch_bytes = BatchDataMap<float>::data_bytes(padded_dim_);
-    const size_t rerank_bytes = rerank_vector_bytes();
-    if (n > max_size / sizeof(PID) || n > max_size / sizeof(float) / padded_dim_ ||
-        n > max_size / batch_bytes || (rerank_bytes != 0 && n > max_size / rerank_bytes) ||
-        cluster_num > max_size / sizeof(float) / padded_dim_ ||
-        (type == RotatorType::MatrixRotator && dim > max_size / sizeof(float) / padded_dim_
-        )) {
-        throw std::invalid_argument("IVF configuration exceeds addressable storage");
-    }
-    rotator_.reset(choose_rotator<float>(dim, type, padded_dim_));
-    /* check size */
-    assert(padded_dim_ % 64 == 0);
-    assert(padded_dim_ >= dim_);
-}
-
-inline IVF::~IVF() { free_memory(); }
-
-/**
- * @brief Construct clusters in IVF
- *
- * @param data Data objects (N*DIM)
- * @param centroids Centroid vectors (K*DIM)
- * @param cluster_ids Cluster ID for each data object
- */
-inline void IVF::construct(
-    const float* data,
-    const float* centroids,
-    const PID* cluster_ids,
-    bool faster = false,
-    size_t num_threads = std::numeric_limits<size_t>::max()
-) {
-    if (num_ == 0 || dim_ == 0 || num_cluster_ == 0 || rotator_ == nullptr) {
-        throw std::logic_error("IVF must be configured before construction");
-    }
-    if (data == nullptr || centroids == nullptr || cluster_ids == nullptr) {
-        throw std::invalid_argument("IVF construction inputs must not be null");
-    }
-
-    // get id list for each cluster
-    std::vector<size_t> counts(num_cluster_, 0);
-    std::vector<std::vector<PID>> id_lists(num_cluster_);
-    for (size_t i = 0; i < num_; ++i) {
-        PID cid = cluster_ids[i];
-        if (cid >= num_cluster_) {
-            throw std::invalid_argument("Cluster ID is out of range");
-        }
-        id_lists[cid].push_back(static_cast<PID>(i));
-        counts[cid] += 1;
-    }
-
-    allocate_memory(counts);
-
-    // init the cluster list
-    init_clusters(counts);
-
-    // all rotated centroids
-    std::vector<float> rotated_centroids(num_cluster_ * padded_dim_);
-
-    quant::RabitqConfig config;
-    if (faster) {
-        config = quant::faster_config(padded_dim_, ex_bits_ + 1);
-    }
-
-    num_threads = resolve_num_threads(num_threads);
-    /* Quantize each cluster */
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(num_cluster_);
-         ++index) {
-        const size_t i = static_cast<size_t>(index);
-        const float* cur_centroid = centroids + (i * dim_);
-        float* cur_rotated_c = &rotated_centroids[i * padded_dim_];
-        Cluster& cp = cluster_lst_[i];
-        quantize_cluster(cp, id_lists[i], data, cur_centroid, cur_rotated_c, config);
-    }
-
-    this->initer_->add_vectors(rotated_centroids.data(), num_threads);
-    ready_ = true;
-}
-
-inline void IVF::allocate_memory(const std::vector<size_t>& cluster_sizes) {
-    ready_ = false;
-    free_memory();
-    cluster_lst_.clear();
-
-    if (num_cluster_ < 20000UL) {
-        this->initer_ =
-            std::make_unique<FlatInitializer>(padded_dim_, num_cluster_, metric_type_);
-    } else {
-        this->initer_ =
-            std::make_unique<HNSWInitializer>(padded_dim_, num_cluster_, metric_type_);
-    }
-    batch_storage_ = ByteStorage(batch_data_bytes(cluster_sizes));
-    if (rerank_vector_bytes() > 0) {
-        if (raw_reranking_) {
-            raw_storage_ = FloatStorage(num_ * dim_);
-        } else {
-            ex_storage_ = ByteStorage(ex_data_bytes());
-        }
-    }
-    id_storage_ = IdStorage(num_);
-
-    this->ip_func_ = select_excode_ipfunc(ex_bits_);
-}
-
-/**
- * @brief Initialize the cluster list by finding each cluster's storage offsets.
- */
-inline void IVF::init_clusters(const std::vector<size_t>& cluster_sizes) {
-    this->cluster_lst_.reserve(num_cluster_);
-    size_t added_vectors = 0;
-    size_t added_batches = 0;
-    for (size_t i = 0; i < num_cluster_; ++i) {
-        // find data location for current cluster
-        size_t num = cluster_sizes[i];
-        size_t num_batches = div_round_up(num, fastscan::kBatchSize);
-
-        char* current_batch_data =
-            batch_data() + (BatchDataMap<float>::data_bytes(padded_dim_) * added_batches);
-        char* current_ex_data = rerank_vector_bytes() > 0
-                                    ? ex_data() + (added_vectors * rerank_vector_bytes())
-                                    : nullptr;
-        PID* cluster_ids = ids() + added_vectors;
-
-        Cluster cur_cluster(num, current_batch_data, current_ex_data, cluster_ids);
-        this->cluster_lst_.push_back(std::move(cur_cluster));
-
-        added_vectors += num;
-        added_batches += num_batches;
-    }
-}
-
-inline void IVF::quantize_cluster(
-    Cluster& cp,
-    const std::vector<PID>& IDs,
-    const float* data,
-    const float* cur_centroid,
-    float* rotated_centroid,
-    const quant::RabitqConfig& config
-) {
-    size_t num_points = IDs.size();
-    if (cp.num() != num_points) {
-        throw std::invalid_argument("Cluster size and ID count differ");
-    }
-
-    // copy ids
-    std::copy(IDs.begin(), IDs.end(), cp.ids());
-
-    // rotate centroid
-    this->rotator_->rotate(cur_centroid, rotated_centroid);
-
-    // rotate vectors for this cluster
-    std::vector<float> rotated_data(padded_dim_ * num_points);
-    for (size_t i = 0; i < num_points; ++i) {
-        const float* vector = data + (IDs[i] * dim_);
-        rotator_->rotate(vector, rotated_data.data() + (i * padded_dim_));
-        if (raw_reranking_) {
-            std::memcpy(
-                cp.ex_data() + (i * rerank_vector_bytes()), vector, rerank_vector_bytes()
-            );
-        }
-    }
-
-    char* batch_data = cp.batch_data();
-    char* ex_data = cp.ex_data();
-    for (size_t i = 0; i < num_points; i += fastscan::kBatchSize) {
-        size_t n = std::min(fastscan::kBatchSize, num_points - i);
-
-        quant::quantize_split_batch(
-            rotated_data.data() + (i * padded_dim_),
-            rotated_centroid,
-            n,
-            padded_dim_,
-            ex_bits_,
-            batch_data,
-            ex_data,
-            metric_type_,
-            config
-        );
-
-        batch_data += BatchDataMap<float>::data_bytes(padded_dim_);
-        if (ex_bits_ > 0) {
-            ex_data += ExDataMap<float>::data_bytes(padded_dim_, ex_bits_) * n;
-        }
-    }
-}
-
-inline void IVF::save(const char* filename) const {
-    if (!ready_ || initer_ == nullptr || rotator_ == nullptr ||
-        cluster_lst_.size() != num_cluster_ || batch_storage_.empty() ||
-        id_storage_.size() != num_) {
-        throw std::logic_error("Cannot save an unconstructed IVF index");
-    }
-    if (filename == nullptr || filename[0] == '\0') {
-        throw std::invalid_argument("IVF save filename must not be empty");
-    }
-
-    std::ofstream output(rabitqlib::io_impl::filesystem_path(filename), std::ios::binary);
-    output.exceptions(std::ios::failbit | std::ios::badbit);
-    if (raw_reranking_) {
-        output.write(
-            reinterpret_cast<const char*>(&kRawFormatMagic), sizeof(kRawFormatMagic)
-        );
-        output.write(
-            reinterpret_cast<const char*>(&kRawFormatVersion), sizeof(kRawFormatVersion)
-        );
-    }
-
-    /* Save meta data */
-    output.write(reinterpret_cast<const char*>(&num_), sizeof(size_t));
-    output.write(reinterpret_cast<const char*>(&dim_), sizeof(size_t));
-    output.write(reinterpret_cast<const char*>(&num_cluster_), sizeof(size_t));
-    output.write(reinterpret_cast<const char*>(&ex_bits_), sizeof(size_t));
-    output.write(reinterpret_cast<const char*>(&type_), sizeof(type_));
-    output.write(reinterpret_cast<const char*>(&metric_type_), sizeof(metric_type_));
-
-    /* Save number of vectors of each cluster */
-    std::vector<size_t> cluster_sizes;
-    cluster_sizes.reserve(num_cluster_);
-    for (const auto& cur_cluster : cluster_lst_) {
-        cluster_sizes.push_back(cur_cluster.num());
-    }
-    output.write(
-        reinterpret_cast<const char*>(cluster_sizes.data()),
-        static_cast<std::streamsize>(sizeof(size_t) * num_cluster_)
-    );
-
-    /* Save rotator */
-    this->rotator_->save(output);
-
-    /* Save data */
-    this->initer_->save(output, filename);
-    output.write(
-        batch_data(), static_cast<std::streamsize>(batch_data_bytes(cluster_sizes))
-    );
-    if (ex_data_bytes() != 0) {
-        output.write(ex_data(), static_cast<std::streamsize>(ex_data_bytes()));
-    }
-    output.write(
-        reinterpret_cast<const char*>(ids()), static_cast<std::streamsize>(ids_bytes())
-    );
-
-    output.close();
-}
-
-inline void IVF::load(const char* filename) {
-    if (filename == nullptr || filename[0] == '\0') {
-        throw std::invalid_argument("IVF load filename must not be empty");
-    }
-    std::ifstream input(rabitqlib::io_impl::filesystem_path(filename), std::ios::binary);
-    if (!input.is_open()) {
-        throw std::runtime_error("Cannot open IVF index file");
-    }
-
-    IVF loaded;
-    input.exceptions(std::ios::failbit | std::ios::badbit);
-    input.seekg(0, std::ios::end);
-    const auto file_bytes = static_cast<size_t>(input.tellg());
-    input.seekg(0);
-    uint64_t magic = 0;
-    input.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    loaded.raw_reranking_ = magic == kRawFormatMagic;
-    if (loaded.raw_reranking_) {
-        uint32_t version = 0;
-        input.read(reinterpret_cast<char*>(&version), sizeof(version));
-        if (version != kRawFormatVersion) {
-            throw std::runtime_error("Unsupported raw IVF index version");
-        }
-    } else {
-        input.seekg(0);
-    }
-
-    /* Load meta data */
-    input.read(reinterpret_cast<char*>(&loaded.num_), sizeof(size_t));
-    input.read(reinterpret_cast<char*>(&loaded.dim_), sizeof(size_t));
-    input.read(reinterpret_cast<char*>(&loaded.num_cluster_), sizeof(size_t));
-    input.read(reinterpret_cast<char*>(&loaded.ex_bits_), sizeof(size_t));
-    input.read(reinterpret_cast<char*>(&loaded.type_), sizeof(loaded.type_));
-    input.read(reinterpret_cast<char*>(&loaded.metric_type_), sizeof(loaded.metric_type_));
-    validate_metric_type(loaded.metric_type_);
-    if (loaded.num_ == 0 || loaded.num_ > buffer::kSearchBufferMaxPointCount ||
-        loaded.dim_ == 0 || loaded.num_cluster_ == 0 ||
-        loaded.num_cluster_ > buffer::kSearchBufferMaxPointCount || loaded.ex_bits_ > 8 ||
-        (loaded.raw_reranking_ && loaded.ex_bits_ != 0) ||
-        loaded.dim_ > (std::numeric_limits<size_t>::max() / 32) - 64) {
-        throw std::runtime_error("Invalid IVF index metadata");
-    }
-    loaded.padded_dim_ = round_up_to_multiple(loaded.dim_, 64);
-    // Bound every payload by the actual file before allocating or multiplying sizes.
-    size_t remaining = file_bytes - static_cast<size_t>(input.tellg());
-    const auto consume = [&remaining](size_t count, size_t bytes) {
-        if (bytes != 0 && count > remaining / bytes) {
-            throw std::runtime_error("Invalid or truncated IVF index payload");
-        }
-        remaining -= count * bytes;
-    };
-    consume(loaded.num_cluster_, sizeof(size_t));
-    consume(loaded.num_, sizeof(PID));
-    consume(loaded.num_, loaded.rerank_vector_bytes());
-    if (loaded.type_ == RotatorType::MatrixRotator) {
-        consume(loaded.dim_, sizeof(float) * loaded.padded_dim_);
-    } else if (loaded.type_ == RotatorType::FhtKacRotator) {
-        consume(1, loaded.padded_dim_ / 2);
-    } else {
-        throw std::runtime_error("Invalid IVF rotator type");
-    }
-    if (loaded.num_cluster_ < 20000UL) {
-        consume(loaded.num_cluster_, sizeof(float) * loaded.padded_dim_);
-    }
-
-    /* Load number of vectors of each cluster */
-    std::vector<size_t> cluster_sizes(loaded.num_cluster_, 0);
-    input.read(
-        reinterpret_cast<char*>(cluster_sizes.data()),
-        static_cast<std::streamsize>(sizeof(size_t) * loaded.num_cluster_)
-    );
-
-    size_t total = 0;
-    for (size_t size : cluster_sizes) {
-        if (size > loaded.num_ - total) {
-            throw std::runtime_error("Invalid cluster counts in IVF index file");
-        }
-        total += size;
-        consume(
-            div_round_up(size, fastscan::kBatchSize),
-            BatchDataMap<float>::data_bytes(loaded.padded_dim_)
-        );
-    }
-    if (total != loaded.num_) {
-        throw std::runtime_error("Invalid cluster counts in IVF index file");
-    }
-    loaded.rotator_.reset(
-        choose_rotator<float>(loaded.dim_, loaded.type_, loaded.padded_dim_)
-    );
-
-    /* Load rotator */
-    loaded.rotator_->load(input);
-
-    /* Load data */
-    loaded.allocate_memory(cluster_sizes);
-    loaded.initer_->load(input, filename);
-    input.read(
-        loaded.batch_data(),
-        static_cast<std::streamsize>(loaded.batch_data_bytes(cluster_sizes))
-    );
-    if (loaded.ex_data_bytes() != 0) {
-        input.read(loaded.ex_data(), static_cast<std::streamsize>(loaded.ex_data_bytes()));
-    }
-    input.read(
-        reinterpret_cast<char*>(loaded.ids()),
-        static_cast<std::streamsize>(loaded.ids_bytes())
-    );
-    for (size_t i = 0; i < loaded.num_; ++i) {
-        if (loaded.ids()[i] >= loaded.num_ ||
-            loaded.ids()[i] >= buffer::kSearchBufferCheckedMask) {
-            throw std::runtime_error("Invalid point ID in IVF index file");
-        }
-    }
-
-    /* Init each cluster */
-    loaded.init_clusters(cluster_sizes);
-    loaded.ready_ = true;
-
-    input.close();
-    swap(loaded);
-}
-
-inline void IVF::search(
-    const float* query, size_t k, size_t nprobe, PID* results, float* dists
-) const {
-    search(query, k, nprobe, results, dists, !raw_reranking_ && ex_bits_ > 2);
-}
-
-inline void IVF::search(
-    const float* __restrict__ query,
-    size_t k,
-    size_t nprobe,
-    PID* __restrict__ results,
-    bool use_hacc
-) const {
-    this->search(query, k, nprobe, results, nullptr, use_hacc);
-}
-
-inline void IVF::search(
-    const float* __restrict__ query,
-    size_t k,
-    size_t nprobe,
-    PID* __restrict__ results,
-    float* __restrict__ dists,
-    bool use_hacc
-) const {
-    if (!ready_ || initer_ == nullptr || rotator_ == nullptr ||
-        cluster_lst_.size() != num_cluster_ || batch_storage_.empty() ||
-        id_storage_.size() != num_) {
-        throw std::logic_error("IVF index must be constructed or loaded before search");
-    }
-    if (query == nullptr) {
-        throw std::invalid_argument("IVF search query must not be null");
-    }
-    if (results == nullptr) {
-        throw std::invalid_argument("IVF search results must not be null");
-    }
-    if (k == 0 || k > num_ || k > buffer::kSearchBufferMaxPointCount) {
-        throw std::invalid_argument("IVF search k must be between 1 and the point count");
-    }
-    if (nprobe == 0) {
-        throw std::invalid_argument("IVF search nprobe must be positive");
-    }
-
-    nprobe = std::min(nprobe, num_cluster_);  // corner case
-    std::vector<float> rotated_query(padded_dim_);
-    this->rotator_->rotate(query, rotated_query.data());
-
-    // use initer to get closest nprobe centroids
-    std::vector<AnnCandidate<float>> centroid_dist(nprobe);
-    this->initer_->centroids_distances(rotated_query.data(), nprobe, centroid_dist);
-
-    buffer::SearchBuffer knns(k);
-
-    SplitBatchQuery<float> q_obj(
-        rotated_query.data(), padded_dim_, ex_bits_, metric_type_, use_hacc
-    );
-
-    for (size_t i = 0; i < nprobe; ++i) {
-        PID cid = centroid_dist[i].id;
-        float dist = centroid_dist[i].distance;
-        const Cluster& cur_cluster = cluster_lst_[cid];
-
-        if (metric_type_ == METRIC_L2) {
-            q_obj.set_g_add(dist);
-        } else if (metric_type_ == METRIC_IP) {
-            const float residual_norm = std::sqrt(
-                euclidean_sqr(rotated_query.data(), initer_->centroid(cid), padded_dim_)
-            );
-            auto g_add_ip = dot_product<float>(
-                rotated_query.data(), initer_->centroid(cid), padded_dim_
-            );
-            q_obj.set_g_add(residual_norm, g_add_ip);
-        } else {
-            // unsupported
-            throw std::invalid_argument("Quantization only supports L2 and IP metrics");
-        }
-        // q_obj.set_g_add(dist);
-        search_cluster(cur_cluster, q_obj, knns, use_hacc, query);
-    }
-
-    const size_t found = knns.size();
-    if (dists != nullptr) {
-        knns.copy_results(results, dists);
-        std::fill(dists + found, dists + k, std::numeric_limits<float>::infinity());
-    } else {
-        knns.copy_results(results);
-    }
-    std::fill(results + found, results + k, kPidMax);
-}
-
-inline void IVF::search_cluster(
-    const Cluster& cur_cluster,
-    const SplitBatchQuery<float>& q_obj,
-    buffer::SearchBuffer<float>& knns,
-    bool use_hacc,
-    const float* query
-) const {
-    size_t iter = cur_cluster.num() / fastscan::kBatchSize;
-    size_t remain = cur_cluster.num() - (iter * fastscan::kBatchSize);
-
-    const char* batch_data = cur_cluster.batch_data();
-    const char* ex_data = cur_cluster.ex_data();
-    const PID* ids = cur_cluster.ids();
-
-    /* Compute distances block by block */
-    for (size_t i = 0; i < iter; ++i) {
-        scan_one_batch(
-            batch_data, ex_data, ids, q_obj, knns, fastscan::kBatchSize, use_hacc, query
-        );
-
-        batch_data += BatchDataMap<float>::data_bytes(padded_dim_);
-        if (rerank_vector_bytes() > 0) {
-            ex_data += rerank_vector_bytes() * fastscan::kBatchSize;
-        }
-        ids += fastscan::kBatchSize;
-    }
-
-    if (remain > 0) {
-        // scan the last block
-        scan_one_batch(batch_data, ex_data, ids, q_obj, knns, remain, use_hacc, query);
-    }
-}
-
-inline void IVF::scan_one_batch(
-    const char* batch_data,
-    const char* ex_data,
-    const PID* ids,
-    const SplitBatchQuery<float>& q_obj,
-    buffer::SearchBuffer<float>& knns,
-    size_t num_points,
-    bool use_hacc,
-    const float* query
-) const {
-    std::array<float, fastscan::kBatchSize> est_distance;  // estimated distance
-    std::array<float, fastscan::kBatchSize> low_distance;  // lower distance
-    std::array<float, fastscan::kBatchSize> ip_x0_qr;      // inner product of the 1st bit
-
-    split_batch_estdist(
-        batch_data,
-        q_obj,
-        padded_dim_,
-        est_distance.data(),
-        low_distance.data(),
-        ip_x0_qr.data(),
-        use_hacc
-    );
-
-    float distk = knns.top_dist();
-
-    // Without reranking data, return the one-bit estimates directly.
-    if (ex_bits_ == 0 && !raw_reranking_) {
-        detail::insert_candidates(knns, ids, est_distance.data(), num_points);
-        return;
-    }
-
-    // incremental distance computation - V2
-    for (size_t i = 0; i < num_points; ++i) {
-        float lower_dist = low_distance[i];
-        if (lower_dist < distk) {
-            PID id = ids[i];
-            float ex_dist;
-            if (raw_reranking_) {
-                const auto* vector = reinterpret_cast<const float*>(ex_data);
-                ex_dist = metric_type_ == METRIC_L2 ? euclidean_sqr(query, vector, dim_)
-                                                    : dot_product_dis(query, vector, dim_);
-            } else {
-                ex_dist = split_distance_boosting(
-                    ex_data, ip_func_, q_obj, padded_dim_, ex_bits_, ip_x0_qr[i]
-                );
-            }
-            knns.insert(id, ex_dist);
-            distk = knns.top_dist();
-        }
-        ex_data += rerank_vector_bytes();
-    }
-}
 }  // namespace rabitqlib::ivf

@@ -2,49 +2,51 @@
 
 #include <cstddef>
 
-#include "rabitqlib/defines.hpp"
+#include "rabitqlib/index/types.hpp"
 
 namespace rabitqlib::ivf {
 
-/**
- * @brief Cluster is used for ivf index with rabitq+. Components are only used for record
- * the addresses for different part of data.
- *
- */
+// Non-owning view of one IVF cluster's codes, reranking data and point IDs.
 class Cluster {
    private:
-    size_t num_;                  // Num of vectors in this cluster
+    friend class IVF;
+
+    size_t num_stored_points_;    // Number of points in this cluster
     char* batch_data_ = nullptr;  // RaBitQ code and factors
     char* ex_data_ = nullptr;     // Extra-bit codes/factors or original float32 vectors
-    PID* ids_ = nullptr;          // PID of vectors
+    PID* ids_ = nullptr;          // PID of each point
+
+    // The owning index refreshes only views whose storage or count changed.
+    void reset(
+        size_t num_stored_points, char* batch_data, char* ex_data, PID* ids
+    ) noexcept {
+        num_stored_points_ = num_stored_points;
+        batch_data_ = batch_data;
+        ex_data_ = ex_data;
+        ids_ = ids;
+    }
 
    public:
-    explicit Cluster(size_t, char*, char*, PID*);
-    Cluster(const Cluster& other);
-    Cluster(Cluster&& other) noexcept;
-    ~Cluster() {}
+    explicit Cluster(size_t num_stored_points, char* batch_data, char* ex_data, PID* ids);
+    Cluster(const Cluster&) = default;
+    Cluster(Cluster&&) noexcept = default;
+    Cluster& operator=(const Cluster&) = delete;
+    Cluster& operator=(Cluster&&) = delete;
+    ~Cluster() = default;
 
-    [[nodiscard]] char* batch_data() const { return this->batch_data_; }
+    [[nodiscard]] char* batch_data() const { return batch_data_; }
 
     [[nodiscard]] char* ex_data() const { return ex_data_; }
 
-    [[nodiscard]] PID* ids() const { return this->ids_; }
+    [[nodiscard]] PID* ids() const { return ids_; }
 
-    [[nodiscard]] size_t num() const { return num_; }
+    [[nodiscard]] size_t num() const { return num_stored_points_; }
 };
 
-inline Cluster::Cluster(size_t num, char* batch_data, char* ex_data, PID* ids)
-    : num_(num), batch_data_(batch_data), ex_data_(ex_data), ids_(ids) {}
+inline Cluster::Cluster(size_t num_stored_points, char* batch_data, char* ex_data, PID* ids)
+    : num_stored_points_(num_stored_points)
+    , batch_data_(batch_data)
+    , ex_data_(ex_data)
+    , ids_(ids) {}
 
-inline Cluster::Cluster(const Cluster& other)
-    : num_(other.num_)
-    , batch_data_(other.batch_data_)
-    , ex_data_(other.ex_data_)
-    , ids_(other.ids_) {}
-
-inline Cluster::Cluster(Cluster&& other) noexcept
-    : num_(other.num_)
-    , batch_data_(other.batch_data_)
-    , ex_data_(other.ex_data_)
-    , ids_(other.ids_) {}
 }  // namespace rabitqlib::ivf

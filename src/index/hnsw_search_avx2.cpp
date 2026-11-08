@@ -1,13 +1,16 @@
 #include <cstddef>
 #include <cstdint>
-#include <utility>
 
 #include "hnsw_search_avx2_kernels.hpp"
-#include "rabitqlib/defines.hpp"
+#include "hnsw_search_impl.hpp"  // IWYU pragma: keep (backend template definitions)
 #include "rabitqlib/index/hnsw/hnsw.hpp"
+#include "rabitqlib/index/types.hpp"
 
 namespace rabitqlib::hnsw::detail {
 
+namespace {
+// Internal linkage keeps every template instantiated with this kernel local to
+// this ISA's translation unit.
 struct HnswAvx2Kernel {
     static inline float warmup_ip_x0_q_512(
         const uint64_t* data,
@@ -26,11 +29,20 @@ struct HnswAvx2Kernel {
         return hnsw_mask_ip_x0_q_avx2(query, data, padded_dim);
     }
 };
+}  // namespace
 
-maxheap<std::pair<float, PID>> search_knn_avx2(
-    HierarchicalNSW& index, const float* rotated_query, size_t topk
+size_t search_layers_avx2(
+    const HierarchicalNSW& index,
+    const SplitSingleQuery<float>& query_wrapper,
+    const float* q_to_centroids,
+    VisitedSet& visited,
+    buffer::SearchBuffer<float>& search_pool,
+    size_t k,
+    AnnCandidate<float>* nearest
 ) {
-    return index.search_knn_direct<HnswAvx2Kernel>(rotated_query, topk);
+    return HnswSearchAccess::search_layers<HnswAvx2Kernel>(
+        index, query_wrapper, q_to_centroids, visited, search_pool, k, nearest
+    );
 }
 
 }  // namespace rabitqlib::hnsw::detail

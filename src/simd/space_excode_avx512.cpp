@@ -1,33 +1,64 @@
 #include <immintrin.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 
-#include "rabitqlib/simd/space_dispatch.hpp"
+#include "packed_tail_avx2.hpp"
+#include "rabitqlib/core/detail/simd/space_dispatch.hpp"
+#include "rabitqlib/utils/bitops.hpp"
 
 namespace rabitqlib::simd::excode_ipimpl {
 
 namespace {
-[[nodiscard]] inline uint64_t load_u64(const uint8_t* data) noexcept {
-    uint64_t value = 0;
-    std::memcpy(&value, data, sizeof(value));
-    return value;
-}
-
-[[nodiscard]] inline __m128i set_u64x(uint64_t high, uint64_t low) noexcept {
-    int64_t signed_high = 0;
-    int64_t signed_low = 0;
-    std::memcpy(&signed_high, &high, sizeof(signed_high));
-    std::memcpy(&signed_low, &low, sizeof(signed_low));
-    return _mm_set_epi64x(signed_high, signed_low);
+template <size_t Bits>
+inline __m512 excode_ip_tail_sum_avx512(
+    const float* query, const uint8_t* compact, __m512 sum
+) {
+    // Static constants avoid short stack stores followed by a wider SIMD reload.
+    alignas(64) static constexpr auto kPositions = [] {
+        std::array<uint8_t, 64> positions{};
+        // Form 32-bit words directly; 0x80 shuffle indices zero their upper bytes.
+        for (size_t i = 0; i < 16; ++i) {
+            positions[4 * i] = static_cast<uint8_t>(i * Bits / 8);
+            positions[4 * i + 1] = static_cast<uint8_t>(i * Bits / 8 + 1);
+            positions[4 * i + 2] = 0x80;
+            positions[4 * i + 3] = 0x80;
+        }
+        return positions;
+    }();
+    alignas(64) static constexpr auto kOffsets = [] {
+        std::array<uint32_t, 16> offsets{};
+        for (size_t i = 0; i < 16; ++i) {
+            offsets[i] = static_cast<uint32_t>(i * Bits % (Bits == 2 ? 32 : 8));
+        }
+        return offsets;
+    }();
+    const __m512i shuffle = _mm512_load_si512(kPositions.data());
+    const __m512i shifts = _mm512_load_si512(kOffsets.data());
+    const __m512i mask = _mm512_set1_epi32((1U << Bits) - 1);
+    for (size_t i = 0; i < 32; i += 16) {
+        const __m128i packed = detail::load_excode_tail<Bits>(compact);
+        __m512i words;
+        if constexpr (Bits == 2) {
+            // All 16 codes fit in one word; broadcast it instead of gathering bytes.
+            words = _mm512_broadcastd_epi32(packed);
+        } else {
+            words = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(packed), shuffle);
+        }
+        const __m512 values =
+            _mm512_cvtepi32_ps(_mm512_and_si512(_mm512_srlv_epi32(words, shifts), mask));
+        sum = _mm512_fmadd_ps(values, _mm512_loadu_ps(query + i), sum);
+        compact += 2 * Bits;
+    }
+    return sum;
 }
 }  // namespace
 
-// ip16: this function is used to compute inner product of
-// vectors padded to multiple of 16
-// fxu1: the inner product is computed between float and 1-bit unsigned int (lay out can be
-// found rabitq_impl.hpp)
-// avx512: only applicable for avx512
+// ip16_fxu1 consumes groups of 16 float query values and packed 1-bit codes.
+// This translation unit uses AVX-512; callers should use runtime dispatch.
+// Packed extra-bit layouts are owned by core/pack_excode.hpp.
+
 float ip16_fxu1_avx512(
     const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
 ) {
@@ -57,10 +88,9 @@ float ip64_fxu2_avx512(
 ) {
     __m512 sum0 = _mm512_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
 
-    float result = 0;
     const __m128i mask = _mm_set1_epi8(0b00000011);
 
-    for (size_t i = 0; i < dim; i += 64) {
+    for (size_t i = 0; i < dim - dim % 64; i += 64) {
         __m128i compact = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
 
         __m128i vec_00_to_15 = _mm_and_si128(compact, mask);
@@ -89,11 +119,12 @@ float ip64_fxu2_avx512(
         compact_code += 16;
     }
 
-    result = _mm512_reduce_add_ps(
-        _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3))
-    );
-
-    return result;
+    __m512 combined = _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3));
+    if (dim % 64 != 0) {
+        combined =
+            excode_ip_tail_sum_avx512<2>(query + dim - dim % 64, compact_code, combined);
+    }
+    return _mm512_reduce_add_ps(combined);
 }
 
 float ip64_fxu3_avx512(
@@ -101,15 +132,14 @@ float ip64_fxu3_avx512(
 ) {
     __m512 sum = _mm512_setzero_ps();
 
-    float result = 0;
     const __m128i mask = _mm_set1_epi8(0b11);
     const __m128i top_mask = _mm_set1_epi8(0b100);
 
-    for (size_t i = 0; i < dim; i += 64) {
+    for (size_t i = 0; i < dim - dim % 64; i += 64) {
         __m128i compact2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         compact_code += 16;
 
-        const uint64_t top_bit = load_u64(compact_code);
+        const uint64_t top_bit = bitops::load_word(compact_code, sizeof(uint64_t));
         compact_code += 8;
 
         __m128i vec_00_to_15 = _mm_and_si128(compact2, mask);
@@ -118,13 +148,13 @@ float ip64_fxu3_avx512(
         __m128i vec_48_to_63 = _mm_and_si128(_mm_srli_epi16(compact2, 6), mask);
 
         __m128i top_00_to_15 =
-            _mm_and_si128(set_u64x(top_bit << 1, top_bit << 2), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit << 1, top_bit << 2), top_mask);
         __m128i top_16_to_31 =
-            _mm_and_si128(set_u64x(top_bit >> 1, top_bit >> 0), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit >> 1, top_bit >> 0), top_mask);
         __m128i top_32_to_47 =
-            _mm_and_si128(set_u64x(top_bit >> 3, top_bit >> 2), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit >> 3, top_bit >> 2), top_mask);
         __m128i top_48_to_63 =
-            _mm_and_si128(set_u64x(top_bit >> 5, top_bit >> 4), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit >> 5, top_bit >> 4), top_mask);
 
         vec_00_to_15 = _mm_or_si128(top_00_to_15, vec_00_to_15);
         vec_16_to_31 = _mm_or_si128(top_16_to_31, vec_16_to_31);
@@ -150,9 +180,12 @@ float ip64_fxu3_avx512(
         sum = _mm512_fmadd_ps(q, cf, sum);
     }
 
-    result = _mm512_reduce_add_ps(sum);
-
-    return result;
+    __m512 combined = sum;
+    if (dim % 64 != 0) {
+        combined =
+            excode_ip_tail_sum_avx512<3>(query + dim - dim % 64, compact_code, combined);
+    }
+    return _mm512_reduce_add_ps(combined);
 }
 
 float ip16_fxu4_avx512(
@@ -188,18 +221,17 @@ float ip64_fxu5_avx512(
 ) {
     __m512 sum = _mm512_setzero_ps();
 
-    float result = 0.0F;
     const __m128i mask = _mm_set1_epi8(0b1111);
     const __m128i top_mask = _mm_set1_epi8(0b10000);
 
-    for (size_t i = 0; i < dim; i += 64) {
+    for (size_t i = 0; i < dim - dim % 64; i += 64) {
         __m128i compact4_1 =
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         __m128i compact4_2 =
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
         compact_code += 32;
 
-        const uint64_t top_bit = load_u64(compact_code);
+        const uint64_t top_bit = bitops::load_word(compact_code, sizeof(uint64_t));
         compact_code += 8;
 
         __m128i vec_00_to_15 = _mm_and_si128(compact4_1, mask);
@@ -208,13 +240,13 @@ float ip64_fxu5_avx512(
         __m128i vec_48_to_63 = _mm_and_si128(_mm_srli_epi16(compact4_2, 4), mask);
 
         __m128i top_00_to_15 =
-            _mm_and_si128(set_u64x(top_bit << 3, top_bit << 4), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit << 3, top_bit << 4), top_mask);
         __m128i top_16_to_31 =
-            _mm_and_si128(set_u64x(top_bit << 1, top_bit << 2), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit << 1, top_bit << 2), top_mask);
         __m128i top_32_to_47 =
-            _mm_and_si128(set_u64x(top_bit >> 1, top_bit >> 0), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit >> 1, top_bit >> 0), top_mask);
         __m128i top_48_to_63 =
-            _mm_and_si128(set_u64x(top_bit >> 3, top_bit >> 2), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit >> 3, top_bit >> 2), top_mask);
 
         vec_00_to_15 = _mm_or_si128(top_00_to_15, vec_00_to_15);
         vec_16_to_31 = _mm_or_si128(top_16_to_31, vec_16_to_31);
@@ -240,9 +272,12 @@ float ip64_fxu5_avx512(
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum = _mm512_fmadd_ps(q, cf, sum);
     }
-    result = _mm512_reduce_add_ps(sum);
-
-    return result;
+    __m512 combined = sum;
+    if (dim % 64 != 0) {
+        combined =
+            excode_ip_tail_sum_avx512<5>(query + dim - dim % 64, compact_code, combined);
+    }
+    return _mm512_reduce_add_ps(combined);
 }
 
 float ip64_fxu6_avx512(
@@ -250,11 +285,10 @@ float ip64_fxu6_avx512(
 ) {
     __m512 sum0 = _mm512_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
 
-    float result = 0.0F;
     const __m128i mask6 = _mm_set1_epi8(0b00111111);
     const __m128i mask2 = _mm_set1_epi8(static_cast<char>(0b11000000));
 
-    for (size_t i = 0; i < dim; i += 64) {
+    for (size_t i = 0; i < dim - dim % 64; i += 64) {
         __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
         __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
@@ -291,11 +325,12 @@ float ip64_fxu6_avx512(
         cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63));
         sum3 = _mm512_fmadd_ps(q, cf, sum3);
     }
-    result = _mm512_reduce_add_ps(
-        _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3))
-    );
-
-    return result;
+    __m512 combined = _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3));
+    if (dim % 64 != 0) {
+        combined =
+            excode_ip_tail_sum_avx512<6>(query + dim - dim % 64, compact_code, combined);
+    }
+    return _mm512_reduce_add_ps(combined);
 }
 
 float ip64_fxu7_avx512(
@@ -303,12 +338,11 @@ float ip64_fxu7_avx512(
 ) {
     __m512 sum = _mm512_setzero_ps();
 
-    float result = 0.0F;
     const __m128i mask6 = _mm_set1_epi8(0b00111111);
     const __m128i mask2 = _mm_set1_epi8(static_cast<char>(0b11000000));
     const __m128i top_mask = _mm_set1_epi8(0b1000000);
 
-    for (size_t i = 0; i < dim; i += 64) {
+    for (size_t i = 0; i < dim - dim % 64; i += 64) {
         __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
         __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
         __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
@@ -325,17 +359,17 @@ float ip64_fxu7_avx512(
             _mm_srli_epi16(_mm_and_si128(cpt3, mask2), 2)
         );
 
-        const uint64_t top_bit = load_u64(compact_code);
+        const uint64_t top_bit = bitops::load_word(compact_code, sizeof(uint64_t));
         compact_code += 8;
 
         __m128i top_00_to_15 =
-            _mm_and_si128(set_u64x(top_bit << 5, top_bit << 6), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit << 5, top_bit << 6), top_mask);
         __m128i top_16_to_31 =
-            _mm_and_si128(set_u64x(top_bit << 3, top_bit << 4), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit << 3, top_bit << 4), top_mask);
         __m128i top_32_to_47 =
-            _mm_and_si128(set_u64x(top_bit << 1, top_bit << 2), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit << 1, top_bit << 2), top_mask);
         __m128i top_48_to_63 =
-            _mm_and_si128(set_u64x(top_bit >> 1, top_bit << 0), top_mask);
+            _mm_and_si128(detail::set_u64x(top_bit >> 1, top_bit << 0), top_mask);
 
         vec_00_to_15 = _mm_or_si128(top_00_to_15, vec_00_to_15);
         vec_16_to_31 = _mm_or_si128(top_16_to_31, vec_16_to_31);
@@ -362,18 +396,21 @@ float ip64_fxu7_avx512(
         sum = _mm512_fmadd_ps(q, cf, sum);
     }
 
-    result = _mm512_reduce_add_ps(sum);
-
-    return result;
+    __m512 combined = sum;
+    if (dim % 64 != 0) {
+        combined =
+            excode_ip_tail_sum_avx512<7>(query + dim - dim % 64, compact_code, combined);
+    }
+    return _mm512_reduce_add_ps(combined);
 }
 
 float ip16_fxu8_avx512(
-    const float* __restrict__ query, const uint8_t* __restrict__ code, size_t dim
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
 ) {
     __m512 sum0 = _mm512_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
     const auto unpack_code = [&](size_t k) {
         return _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + k))
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + k))
         ));
     };
     size_t i = 0;

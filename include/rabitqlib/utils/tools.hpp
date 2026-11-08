@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <queue>
 #include <random>
 #include <thread>
@@ -46,18 +47,29 @@ inline T rand_integer(T min, T max) {
     return distribution(generator);
 }
 
+template <typename T>
+constexpr T div_round_up(T x, T divisor) {
+    static_assert(std::is_integral_v<T>, "T must be an integral type");
+    return (x / divisor) + static_cast<T>((x % divisor) != 0);
+}
+
 constexpr size_t div_round_up(size_t val, size_t div) {
-    return (val / div) + static_cast<size_t>((val % div) != 0);
+    return div_round_up<size_t>(val, div);
 }
 
 constexpr size_t round_up_to_multiple(size_t val, size_t multiple_of) {
-    return multiple_of * (div_round_up(val, multiple_of));
+    return multiple_of * div_round_up(val, multiple_of);
+}
+
+template <typename T>
+constexpr T round_up_to_multiple_of(size_t x, size_t multiple_of) {
+    return round_up_to_multiple(x, multiple_of);
 }
 
 inline size_t floor_log2(size_t x) {
     size_t ret = 0;
     while (x > 1) {
-        ret++;
+        ++ret;
         x >>= 1;
     }
     return ret;
@@ -70,28 +82,37 @@ inline size_t ceil_log2(size_t x) {
 
 inline bool is_powerof2(size_t n) { return n > 0 && (n & (n - 1)) == 0; }
 
-template <typename T>
-constexpr T div_round_up(T x, T divisor) {
-    static_assert(std::is_integral_v<T>, "T must be an integral type");
-    return (x / divisor) + static_cast<T>((x % divisor) != 0);
-}
+// Available logical CPUs in the calling context, with a hardware-count fallback.
+size_t total_threads();
 
-template <typename T>
-constexpr T round_up_to_multiple_of(size_t x, size_t multiple_of) {
-    return multiple_of * (div_round_up(x, multiple_of));
-}
+// total_threads() capped by the OpenMP thread limit (OMP_NUM_THREADS or
+// omp_set_num_threads), so applications can limit every automatic team.
+size_t default_threads();
 
-// get number of threads of current sys
-inline size_t total_threads() {
-    const auto threads = std::thread::hardware_concurrency();
-    return threads == 0 ? 1 : threads;
-}
-
-// Zero selects all hardware threads; explicit requests cannot exceed that count.
+// Zero selects default_threads(); explicit requests cannot exceed total_threads().
 inline size_t resolve_num_threads(size_t requested) {
-    const size_t available = total_threads();
-    return requested == 0 ? available : std::min(requested, available);
+    if (requested == 1) {
+        return 1;
+    }
+    if (requested == 0) {
+        return default_threads();
+    }
+    return std::min(requested, total_threads());
 }
+
+namespace detail {
+// OpenMP team size for work_items items: at least one and representable as int.
+inline int openmp_team_size(size_t requested, size_t work_items) {
+    return static_cast<int>(std::max<size_t>(
+        1,
+        std::min(
+            {resolve_num_threads(requested),
+             work_items,
+             static_cast<size_t>(std::numeric_limits<int>::max())}
+        )
+    ));
+}
+}  // namespace detail
 
 template <typename T, typename TP>
 float distance_ratio(

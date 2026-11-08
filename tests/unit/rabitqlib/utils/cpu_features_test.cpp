@@ -1,0 +1,163 @@
+#include "rabitqlib/utils/cpu_features.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+
+namespace {
+
+rabitqlib::cpu::Features all_hardware_features() {
+    return {
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    };
+}
+
+TEST(CpuFeaturesTest, ReturnsStableResult) {
+    const auto& first = rabitqlib::cpu::features();
+    const auto& second = rabitqlib::cpu::features();
+
+    ASSERT_EQ(&first, &second);
+    ASSERT_EQ(
+        rabitqlib::cpu::has_avx512_popcnt(),
+        rabitqlib::cpu::has_avx512_core() && first.avx512vpopcntdq
+    );
+}
+
+// The emulated CI runs must fail instead of silently skipping optional backends.
+TEST(CpuFeaturesTest, MatchesRequiredEmulatedCpu) {
+    const bool avx2 = rabitqlib::cpu::has_avx2();
+    const bool avx512 = rabitqlib::cpu::has_avx512_core();
+    const bool popcnt = rabitqlib::cpu::has_avx512_popcnt();
+    const bool neon = rabitqlib::cpu::has_neon();
+    std::cout << "SIMD capabilities: AVX2/FMA=" << avx2 << " AVX512=" << avx512
+              << " AVX512_VPOPCNTDQ=" << popcnt << " NEON=" << neon << '\n';
+    const char* required = std::getenv("RABITQ_TEST_CPU");
+    if (required == nullptr) {
+        return;
+    }
+    SCOPED_TRACE(required);
+    ASSERT_TRUE(std::strcmp(required, "hsw") == 0 || std::strcmp(required, "icl") == 0)
+        << "RABITQ_TEST_CPU must be hsw or icl";
+    EXPECT_TRUE(avx2);
+    EXPECT_FALSE(neon);
+    const bool require_avx512 = std::strcmp(required, "icl") == 0;
+    EXPECT_EQ(avx512, require_avx512);
+    EXPECT_EQ(popcnt, require_avx512);
+}
+
+TEST(CpuFeaturesTest, RequiresOsManagedAvxState) {
+    constexpr uint64_t kAvxState = 0x6;
+    const auto hardware = all_hardware_features();
+
+    auto usable =
+        rabitqlib::cpu::detail::filter_usable_features(hardware, true, false, kAvxState);
+    EXPECT_FALSE(usable.avx2);
+    EXPECT_FALSE(usable.fma);
+    EXPECT_FALSE(usable.avx512f);
+
+    usable =
+        rabitqlib::cpu::detail::filter_usable_features(hardware, false, true, kAvxState);
+    EXPECT_FALSE(usable.avx2);
+    EXPECT_FALSE(usable.fma);
+    EXPECT_FALSE(usable.avx512f);
+
+    usable = rabitqlib::cpu::detail::filter_usable_features(hardware, true, true, 0);
+    EXPECT_FALSE(usable.avx2);
+    EXPECT_FALSE(usable.fma);
+    EXPECT_FALSE(usable.avx512f);
+}
+
+TEST(CpuFeaturesTest, EnablesAvx2WithoutAvx512State) {
+    constexpr uint64_t kAvxState = 0x6;
+    const auto usable = rabitqlib::cpu::detail::filter_usable_features(
+        all_hardware_features(), true, true, kAvxState
+    );
+
+    EXPECT_TRUE(usable.avx2);
+    EXPECT_TRUE(usable.fma);
+    EXPECT_FALSE(usable.avx512f);
+    EXPECT_FALSE(usable.avx512bw);
+    EXPECT_FALSE(usable.avx512dq);
+    EXPECT_FALSE(usable.avx512vpopcntdq);
+    EXPECT_FALSE(usable.avx512vl);
+    EXPECT_FALSE(usable.avx512cd);
+}
+
+TEST(CpuFeaturesTest, EnablesAvx512OnlyWithCompleteAvx512State) {
+    constexpr uint64_t kAvx512State = 0xe6;
+    const auto usable = rabitqlib::cpu::detail::filter_usable_features(
+        all_hardware_features(), true, true, kAvx512State
+    );
+
+    EXPECT_TRUE(usable.avx2);
+    EXPECT_TRUE(usable.fma);
+    EXPECT_TRUE(usable.avx512f);
+    EXPECT_TRUE(usable.avx512bw);
+    EXPECT_TRUE(usable.avx512dq);
+    EXPECT_TRUE(usable.avx512vpopcntdq);
+    EXPECT_TRUE(usable.avx512vl);
+    EXPECT_TRUE(usable.avx512cd);
+
+    for (const uint64_t state_bit :
+         {uint64_t{1} << 5, uint64_t{1} << 6, uint64_t{1} << 7}) {
+        const auto incomplete = rabitqlib::cpu::detail::filter_usable_features(
+            all_hardware_features(), true, true, kAvx512State & ~state_bit
+        );
+        EXPECT_TRUE(incomplete.avx2);
+        EXPECT_TRUE(incomplete.fma);
+        EXPECT_FALSE(incomplete.avx512f);
+        EXPECT_FALSE(incomplete.avx512bw);
+        EXPECT_FALSE(incomplete.avx512dq);
+        EXPECT_FALSE(incomplete.avx512vpopcntdq);
+        EXPECT_FALSE(incomplete.avx512vl);
+        EXPECT_FALSE(incomplete.avx512cd);
+    }
+}
+
+TEST(CpuFeaturesTest, Avx512SelectionRequiresEveryCompilerEnabledFeature) {
+    using rabitqlib::cpu::Features;
+    using rabitqlib::cpu::detail::supports_avx512_core;
+    EXPECT_TRUE(supports_avx512_core(all_hardware_features()));
+    for (auto feature :
+         {&Features::avx2,
+          &Features::fma,
+          &Features::avx512f,
+          &Features::avx512bw,
+          &Features::avx512dq}) {
+        auto missing = all_hardware_features();
+        missing.*feature = false;
+        EXPECT_FALSE(supports_avx512_core(missing));
+    }
+    for (auto feature : {&Features::avx512vl, &Features::avx512cd}) {
+        auto missing = all_hardware_features();
+        missing.*feature = false;
+#if defined(_MSC_VER)
+        EXPECT_FALSE(supports_avx512_core(missing));
+#else
+        EXPECT_TRUE(supports_avx512_core(missing));
+#endif
+    }
+}
+
+}  // namespace
+
+TEST(CpuFeaturesTest, NativeArm64UsesNeonWithoutX86Features) {
+#if defined(__aarch64__)
+    EXPECT_TRUE(rabitqlib::cpu::has_neon());
+    EXPECT_FALSE(rabitqlib::cpu::has_avx2());
+    EXPECT_FALSE(rabitqlib::cpu::has_avx512_core());
+    EXPECT_FALSE(rabitqlib::cpu::has_avx512_popcnt());
+#else
+    EXPECT_FALSE(rabitqlib::cpu::has_neon());
+#endif
+}

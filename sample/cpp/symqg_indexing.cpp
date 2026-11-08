@@ -1,20 +1,25 @@
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-#include "rabitqlib/defines.hpp"
+#include "rabitqlib/core/detail/eigen.hpp"
+#include "rabitqlib/core/metric.hpp"
+#include "rabitqlib/core/rotator.hpp"
 #include "rabitqlib/index/symqg/qg.hpp"
 #include "rabitqlib/index/symqg/qg_builder.hpp"
+#include "rabitqlib/index/types.hpp"
 #include "rabitqlib/utils/io.hpp"
 #include "rabitqlib/utils/stopw.hpp"
+#include "rabitqlib/utils/tools.hpp"
 
 using PID = rabitqlib::PID;
 using index_type = rabitqlib::symqg::QuantizedGraph<float>;
 using data_type = rabitqlib::RowMajorArray<float>;
-using gt_type = rabitqlib::RowMajorArray<uint32_t>;
 
 int run(int argc, char** argv) {
     if (argc < 5) {
@@ -92,9 +97,9 @@ int run(int argc, char** argv) {
         std::cout << "Average degree " << builder.avg_degree() << '\n';
     }  // Release builder scratch before saving.
 
-    auto milisecs = stopw.get_elapsed_mili();
+    auto millisecs = stopw.get_elapsed_mili();
 
-    std::cout << "Indexing time " << milisecs / 1000.F << " secs\n";
+    std::cout << "Indexing time " << millisecs / 1000.F << " secs\n";
 
     qg.save(index_file);
 

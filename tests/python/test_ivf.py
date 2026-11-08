@@ -1,0 +1,820 @@
+"""Tests for IvfIndex: construction, search, properties, error handling, save/load."""
+
+import re
+from pathlib import Path
+
+import numpy as np
+import pytest
+from conftest import DIM, N_CLUSTERS, N_QUERIES, N_VECTORS, brute_force_knn, recall_at_k
+from rabitqlib import IvfIndex
+
+_TOPK = 10
+_NPROBE_ALL = N_CLUSTERS  # probe every cluster → deterministic coverage
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def built_ivf(base_data, clusters):
+    idx = IvfIndex(DIM, N_VECTORS, N_CLUSTERS, nbits=4)
+    centroids, cluster_ids = clusters
+    idx.build(base_data, centroids, cluster_ids)
+    return idx
+
+
+# ── construction ──────────────────────────────────────────────────────────────
+
+
+def test_properties(built_ivf):
+    assert built_ivf.is_built
+    assert built_ivf.dim == DIM
+    assert built_ivf.num_clusters == N_CLUSTERS
+    assert built_ivf.nbits == 4
+    assert built_ivf.metric == "l2"
+    assert built_ivf.max_elements == N_VECTORS
+
+
+# ── search output shape and dtype ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "nq,k,nprobe",
+    [(N_QUERIES, _TOPK, _NPROBE_ALL), (1, 1, _NPROBE_ALL), (N_QUERIES, 1, 1)],
+)
+def test_search_output_contract(built_ivf, query_data, nq, k, nprobe):
+    ids, dists = built_ivf.search(query_data[:nq], k=k, nprobe=nprobe)
+    assert ids.shape == dists.shape == (nq, k)
+    assert ids.dtype == np.uint32
+    assert dists.dtype == np.float32
+    assert np.all(ids < N_VECTORS)
+    assert np.isfinite(dists).all()
+    assert np.all(dists >= 0)
+
+
+# C++ BatchSearchMatchesIndividualQueries covers every width; exercise binding
+# batching for sign-only, extra-bit and owned-float storage here.
+@pytest.mark.parametrize("bits", [1, 4, 32])
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+def test_batch_search_matches_individual_queries(bits, metric):
+    rng = np.random.default_rng(73)
+    data = rng.standard_normal((97, 65)).astype(np.float32)
+    queries = rng.standard_normal((13, 65)).astype(np.float32)
+    centroids = data[:4].copy()
+    labels = np.arange(len(data), dtype=np.uint32) % 3
+    index = IvfIndex(65, len(data), 4, bits, metric=metric)
+    index.build(data, centroids, labels)
+    for hacc in [None, False, True]:
+        for nprobe in [1, 99]:
+            kwargs = dict(k=7, nprobe=nprobe, high_accuracy=hacc)
+            individual = [index.search(q[None, :], **kwargs) for q in queries]
+            expected_ids = np.concatenate([result[0] for result in individual])
+            expected_distances = np.concatenate([result[1] for result in individual])
+            for threads in [1, 2, 4]:
+                ids, distances = index.search(queries, num_threads=threads, **kwargs)
+                np.testing.assert_array_equal(ids, expected_ids)
+                np.testing.assert_array_equal(distances, expected_distances)
+                one_ids, one_distances = index.search(
+                    queries[:1], num_threads=threads, **kwargs
+                )
+                np.testing.assert_array_equal(one_ids, expected_ids[:1])
+                np.testing.assert_array_equal(one_distances, expected_distances[:1])
+                empty_ids, empty_distances = index.search(
+                    queries[:0], num_threads=threads, **kwargs
+                )
+                assert empty_ids.shape == empty_distances.shape == (0, 7)
+    index.remove(np.arange(len(data)))
+    ids, distances = index.search(queries, k=7, nprobe=4, num_threads=4)
+    assert np.all(ids == np.iinfo(np.uint32).max)
+    assert np.all(np.isinf(distances))
+
+
+def test_unfilled_results_use_sentinels():
+    data = np.zeros((4, DIM), dtype=np.float32)
+    data[1:] = 100.0
+    centroids = np.stack((data[0], data[1]))
+    cluster_ids = np.array([0, 1, 1, 1], dtype=np.uint32)
+    idx = IvfIndex(DIM, 4, 2, nbits=4)
+    idx.build(data, centroids, cluster_ids)
+
+    ids, dists = idx.search(data[:1], k=3, nprobe=1)
+    assert ids[0, 0] == 0
+    np.testing.assert_array_equal(ids[0, 1:], np.iinfo(np.uint32).max)
+    assert np.all(np.isinf(dists[0, 1:]))
+
+
+# ── search correctness ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("fast_quantization", [False, True])
+def test_self_retrieval(built_ivf, base_data, clusters, fast_quantization):
+    """Probing all clusters: each database vector must be its own nearest neighbor."""
+    idx = built_ivf
+    if fast_quantization:
+        idx = IvfIndex(DIM, N_VECTORS, N_CLUSTERS, nbits=4)
+        centroids, cluster_ids = clusters
+        idx.build(base_data, centroids, cluster_ids, fast_quantization=True)
+    assert idx.is_built
+    probes = base_data[:10]
+    ids, _ = idx.search(probes, k=1, nprobe=_NPROBE_ALL)
+    for i in range(10):
+        assert i in ids[i], f"Vector {i} not found in its own top-1 result"
+
+
+def test_recall_vs_brute_force(built_ivf, base_data, query_data):
+    """Approximate recall should exceed 0.5 when probing all clusters."""
+    k = 5
+    approx_ids, _ = built_ivf.search(query_data, k=k, nprobe=_NPROBE_ALL)
+    exact_ids, _ = brute_force_knn(base_data, query_data, k)
+    r = recall_at_k(approx_ids, exact_ids, k)
+    assert r >= 0.5, f"Recall {r:.3f} too low"
+
+
+def test_inner_product_routing_uses_inner_product():
+    data = np.zeros((2, DIM), dtype=np.float32)
+    data[0, 0] = 0.9
+    data[1, 0] = 100.0
+    centroids = data.copy()
+    cluster_ids = np.array([0, 1], dtype=np.uint32)
+    query = np.zeros((1, DIM), dtype=np.float32)
+    query[0, 0] = 1.0
+
+    idx = IvfIndex(DIM, 2, 2, nbits=32, metric="ip")
+    idx.build(data, centroids, cluster_ids, num_threads=1)
+    ids, distances = idx.search(query, k=1, nprobe=1, num_threads=1)
+
+    assert ids[0, 0] == 1
+    np.testing.assert_allclose(distances[0, 0], -99.0, rtol=0, atol=1e-5)
+
+
+# ── optional parameters ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("nbits", [4, 8])
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+def test_full_quantization_centroid_distances_roundtrip(nbits, metric, tmp_path):
+    # Exercise a tail batch and a padded dimension, including a zero residual.
+    rng = np.random.default_rng(42)
+    data = rng.standard_normal((33, 129)).astype(np.float32)
+    data[0] = 0
+    centroid = np.zeros((1, 129), dtype=np.float32)
+    idx = IvfIndex(129, len(data), 1, nbits=nbits, metric=metric)
+    idx.build(
+        data,
+        centroid,
+        np.zeros(len(data), dtype=np.uint32),
+        fast_quantization=False,
+        num_threads=1,
+    )
+
+    ids, distances = idx.search(centroid, k=len(data), nprobe=1, num_threads=1)
+    expected = (
+        np.einsum("ij,ij->i", data, data)
+        if metric == "l2"
+        else np.ones(len(data), dtype=np.float32)
+    )
+    np.testing.assert_array_equal(np.sort(ids[0]), np.arange(len(data)))
+    np.testing.assert_allclose(distances[0], expected[ids[0]], rtol=2e-5, atol=2e-5)
+
+    path = str(tmp_path / "quantized.index")
+    idx.save(path)
+    loaded = IvfIndex.load(path)
+    loaded_ids, loaded_distances = loaded.search(
+        centroid, k=len(data), nprobe=1, num_threads=1
+    )
+    np.testing.assert_array_equal(loaded_ids, ids)
+    np.testing.assert_array_equal(loaded_distances, distances)
+
+
+# ── error handling ────────────────────────────────────────────────────────────
+
+
+def test_wrong_data_dim_raises(clusters):
+    idx = IvfIndex(DIM, N_VECTORS, N_CLUSTERS, nbits=4)
+    centroids, cluster_ids = clusters
+    bad_data = np.zeros((N_VECTORS, DIM + 1), dtype=np.float32)
+    with pytest.raises(
+        ValueError,
+        match="^"
+        + re.escape(
+            f"data dimension does not match index dim; expected last dimension {DIM}, got shape {bad_data.shape}"
+        )
+        + "$",
+    ):
+        idx.build(bad_data, centroids, cluster_ids)
+
+
+def test_wrong_centroid_dim_raises(base_data, clusters):
+    idx = IvfIndex(DIM, N_VECTORS, N_CLUSTERS, nbits=4)
+    _, cluster_ids = clusters
+    bad_centroids = np.zeros((N_CLUSTERS, DIM + 1), dtype=np.float32)
+    with pytest.raises(
+        ValueError,
+        match="^"
+        + re.escape(
+            f"centroid dimension does not match index dim; expected last dimension {DIM}, got shape {bad_centroids.shape}"
+        )
+        + "$",
+    ):
+        idx.build(base_data, bad_centroids, cluster_ids)
+
+
+def test_wrong_cluster_ids_length_raises(base_data, clusters):
+    idx = IvfIndex(DIM, N_VECTORS, N_CLUSTERS, nbits=4)
+    centroids, _ = clusters
+    bad_ids = np.zeros(N_VECTORS + 5, dtype=np.uint32)
+    with pytest.raises(
+        ValueError,
+        match=f"^cluster_ids length must match number of rows in data; expected {N_VECTORS} IDs, got {len(bad_ids)}$",
+    ):
+        idx.build(base_data, centroids, bad_ids)
+
+
+def test_wrong_query_dim_raises(built_ivf):
+    bad_queries = np.zeros((5, DIM + 1), dtype=np.float32)
+    with pytest.raises(
+        ValueError,
+        match="^"
+        + re.escape(
+            f"query dimension does not match index dim; expected last dimension {DIM}, got shape {bad_queries.shape}"
+        )
+        + "$",
+    ):
+        built_ivf.search(bad_queries, k=1, nprobe=1)
+
+
+def test_search_before_build_raises(query_data):
+    idx = IvfIndex(DIM, N_VECTORS, N_CLUSTERS, nbits=4)
+    with pytest.raises(
+        RuntimeError, match="^IvfIndex must be trained or loaded before search$"
+    ):
+        idx.search(query_data[:1], k=1, nprobe=1)
+
+
+# ── save / load roundtrip ─────────────────────────────────────────────────────
+
+
+def test_save_load_roundtrip(built_ivf, query_data, tmp_path):
+    path = str(tmp_path / "ivf.index")
+    built_ivf.save(path)
+
+    loaded = IvfIndex.load(path)
+    assert loaded.is_built
+    assert loaded.dim == built_ivf.dim
+    assert loaded.num_clusters == built_ivf.num_clusters
+    assert loaded.nbits == built_ivf.nbits
+
+    ids_orig, dists_orig = built_ivf.search(query_data, k=_TOPK, nprobe=_NPROBE_ALL)
+    ids_load, dists_load = loaded.search(query_data, k=_TOPK, nprobe=_NPROBE_ALL)
+    np.testing.assert_array_equal(ids_orig, ids_load)
+    np.testing.assert_allclose(dists_orig, dists_load, rtol=1e-5)
+
+
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+@pytest.mark.parametrize("high_accuracy", [False, True])
+@pytest.mark.parametrize("fast_quantization", [False, True])
+def test_raw_reranking(metric, high_accuracy, fast_quantization, tmp_path):
+    # Dimension/backend arithmetic is covered in C++; this matrix checks the
+    # Python flags, original-vector ownership and raw persistence payload.
+    dim = 65
+    rng = np.random.default_rng(71)
+    data = rng.standard_normal((65, dim)).astype(np.float32)
+    data[0] = 0  # zero residual, padded dimension, and tail batches
+    queries = rng.standard_normal((3, dim)).astype(np.float32)
+    idx = IvfIndex(dim, len(data), 3, 32, metric)
+    cluster_ids = np.arange(len(data), dtype=np.uint32) % 2  # empty third cluster
+    idx.build(
+        data,
+        np.zeros((3, dim), dtype=np.float32),
+        cluster_ids,
+        fast_quantization=fast_quantization,
+        num_threads=2,
+    )
+    # Use a wider oracle: float32 BLAS reduction error near cancellation can
+    # exceed the tolerance even when the returned float32 distance is accurate.
+    reference_data = data.astype(np.float64)
+    reference_queries = queries.astype(np.float64)
+    expected = (
+        np.sum((reference_queries[:, None] - reference_data) ** 2, axis=2)
+        if metric == "l2"
+        else 1 - reference_queries @ reference_data.T
+    )
+    original = data.copy()
+    data[:] = 1000  # the index must own the raw data
+    path = tmp_path / "raw.index"
+    idx.save(str(path))
+    loaded = IvfIndex.load(str(path))
+    assert idx.nbits == loaded.nbits == 32
+    assert loaded.dim == dim
+    assert loaded.metric == metric
+    for k in (5, len(data)):
+        ids, distances = idx.search(queries, k, 3, high_accuracy, 2)
+        loaded_ids, loaded_distances = loaded.search(queries, k, 3, high_accuracy, 2)
+        np.testing.assert_array_equal(loaded_ids, ids)
+        np.testing.assert_array_equal(loaded_distances, distances)
+        np.testing.assert_allclose(
+            distances, np.take_along_axis(expected, ids, axis=1), rtol=2e-5, atol=2e-5
+        )
+        assert np.all(np.diff(distances, axis=1) >= 0)
+        if k == len(data):
+            np.testing.assert_array_equal(ids, np.argsort(expected, axis=1))
+
+    # The reranking region contains precisely original floats in cluster order,
+    # with no extra-bit codes/factors or padded coordinates.
+    payload = path.read_bytes()
+    ids_bytes = len(data) * np.dtype(np.uint32).itemsize
+    raw_bytes = original.nbytes
+    stored = np.frombuffer(
+        payload[-ids_bytes - raw_bytes : -ids_bytes], dtype=np.float32
+    )
+    order = np.argsort(cluster_ids, kind="stable")
+    np.testing.assert_array_equal(stored.reshape(original.shape), original[order])
+    one_bit = IvfIndex(dim, len(data), 3, 1, metric)
+    one_bit.build(original, np.zeros((3, dim), dtype=np.float32), cluster_ids)
+    one_bit_path = tmp_path / "one-bit.index"
+    one_bit.save(str(one_bit_path))
+    assert len(payload) - one_bit_path.stat().st_size == raw_bytes
+
+
+@pytest.mark.parametrize(
+    "filename,dim,bits,padded,nonzero_distances",
+    [
+        ("ivf_legacy_4bit.index", 64, 4, 64, [27.25, 32.31400681, 50.34958267]),
+        (
+            "ivf_legacy_padding65_1bit.index",
+            65,
+            1,
+            128,
+            [27.81249809, 36.12752914, 47.54097748],
+        ),
+        ("ivf_raw_v1_padding65.index", 65, 32, 128, [27.8125, 33.8125, 49.8125]),
+    ],
+)
+def test_legacy_ivf_fixture(tmp_path, filename, dim, bits, padded, nonzero_distances):
+    path = Path(__file__).parent / "fixtures" / filename
+    idx = IvfIndex.load(str(path))
+    assert (idx.dim, idx.max_elements, idx.num_clusters, idx.nbits, idx.metric) == (
+        dim,
+        3,
+        1,
+        bits,
+        "l2",
+    )
+    queries = np.zeros((2, dim), np.float32)
+    # Expected nonzero-query results were recorded with the pad64 implementation
+    # at a065785, before the padding changes.
+    queries[1] = (np.arange(dim) % 9 - 4) / 4
+    ids, distances = idx.search(queries, 3, 1)
+    np.testing.assert_array_equal(np.sort(ids[0]), [0, 1, 2])
+    np.testing.assert_allclose(distances[0], [0, 14, 14], atol=2e-5)
+    np.testing.assert_array_equal(ids[1], [0, 2, 1])
+    np.testing.assert_allclose(distances[1], nonzero_distances, rtol=2e-6)
+    saved = tmp_path / "legacy.index"
+    idx.save(str(saved))
+    payload = saved.read_bytes()
+    assert payload[:8] == b"RABQIDX1"
+    assert int.from_bytes(payload[16:24], "little") == padded
+    loaded_ids, loaded_distances = IvfIndex.load(str(saved)).search(queries, 3, 1)
+    np.testing.assert_array_equal(loaded_ids, ids)
+    np.testing.assert_array_equal(loaded_distances, distances)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "version",
+        "ex_bits",
+        "flags",
+        "padding_too_small",
+        "padding_unaligned",
+        "padding_overflow",
+        "dimension",
+        "count",
+        "clusters",
+        "truncated_header",
+        "truncated_payload",
+    ],
+)
+def test_raw_index_rejects_invalid_files(tmp_path, damage):
+    data = np.zeros((2, 65), dtype=np.float32)
+    idx = IvfIndex(65, 2, 1, 32)
+    idx.build(data, data[:1], np.zeros(2, dtype=np.uint32))
+    path = tmp_path / "invalid.index"
+    idx.save(str(path))
+    payload = bytearray(path.read_bytes())
+    if damage == "version":
+        payload[8:12] = (99).to_bytes(4, "little")
+    elif damage == "flags":
+        payload[12:16] = (2).to_bytes(4, "little")
+    elif damage.startswith("padding_"):
+        padded = {
+            "padding_too_small": 64,
+            "padding_unaligned": 81,
+            "padding_overflow": 2**64 - 16,
+        }[damage]
+        payload[16:24] = padded.to_bytes(8, "little")
+    elif damage == "ex_bits":
+        payload[52:60] = (1).to_bytes(8, "little")
+    elif damage == "dimension":
+        payload[36:44] = (2**64 - 1).to_bytes(8, "little")
+    elif damage == "count":
+        payload[28:36] = (2**64 - 1).to_bytes(8, "little")
+    elif damage == "clusters":
+        payload[44:52] = (2**64 - 1).to_bytes(8, "little")
+    elif damage == "truncated_header":
+        payload = payload[:9]
+    else:
+        payload = payload[:-1]
+    path.write_bytes(payload)
+    with pytest.raises(RuntimeError):
+        IvfIndex.load(str(path))
+
+
+@pytest.mark.parametrize("nbits", [0, 10, 31, 33])
+def test_invalid_ivf_bits(nbits):
+    with pytest.raises(ValueError, match="IVF bits must be in"):
+        IvfIndex(3, 2, 1, nbits)
+
+
+@pytest.mark.parametrize("nbits", [1, 2, 3, 4, 5, 6, 7, 8, 9, 32])
+def test_automatic_high_accuracy(nbits, tmp_path):
+    rng = np.random.default_rng(29)
+    data = rng.standard_normal((65, 65)).astype(np.float32)
+    queries = rng.standard_normal((3, 65)).astype(np.float32)
+    index = IvfIndex(65, len(data), 1, nbits)
+    index.build(
+        data, np.zeros((1, 65), dtype=np.float32), np.zeros(len(data), dtype=np.uint32)
+    )
+    path = tmp_path / "auto.index"
+    index.save(str(path))
+    for idx in (index, IvfIndex.load(str(path))):
+        expected = idx.search(queries, 7, 1, high_accuracy=4 <= nbits <= 9)
+        for actual in (
+            idx.search(queries, 7, 1),
+            idx.search(queries, 7, 1, high_accuracy=None),
+        ):
+            np.testing.assert_array_equal(actual[0], expected[0])
+            np.testing.assert_array_equal(actual[1], expected[1])
+
+
+@pytest.mark.parametrize("failure", ["open", "write"])
+def test_hnsw_sidecar_save_failures(tmp_path, failure):
+    if failure == "write" and not Path("/dev/full").exists():
+        pytest.skip("requires a device that rejects writes")
+    data = np.zeros((2, 64), dtype=np.float32)
+    data[1, 0] = 1
+    idx = IvfIndex(64, 2, 2, nbits=32, initializer="hnsw")
+    idx.build(data, data, np.arange(2, dtype=np.uint32))
+    expected = idx.search(data, 1, 1)
+    path = tmp_path / "sidecar_failure.index"
+    sidecar = Path(str(path) + ".hnsw")
+    if failure == "open":
+        sidecar.mkdir()
+        message = "Cannot open HNSW index file for writing"
+    else:
+        sidecar.symlink_to("/dev/full")
+        message = None  # The stream failure message depends on the standard library.
+    with pytest.raises(RuntimeError, match=message):
+        idx.save(str(path))
+    if failure == "open":
+        sidecar.rmdir()
+    else:
+        sidecar.unlink()
+    # Failure does not invalidate the in-memory index, and saving can be retried.
+    idx.save(str(path))
+    for obj in (idx, IvfIndex.load(str(path))):
+        actual = obj.search(data, 1, 1)
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+
+
+def test_hnsw_centroid_routing_roundtrip(tmp_path):
+    # Explicit routing keeps HNSW coverage independent of the auto thresholds.
+    # One vector per centroid makes nearest-centroid IDs and distances exact.
+    rng = np.random.default_rng(314)
+    count, dim = 128, 64
+    centroids = rng.standard_normal((count, dim)).astype(np.float32)
+    labels = np.arange(count, dtype=np.uint32)
+    idx = IvfIndex(dim, count, count, nbits=1, initializer="hnsw")
+    idx.build(centroids, centroids, labels, num_threads=4)
+    selected = np.array([0, 17, 63, count - 1])
+    queries = centroids[selected]
+    ids, distances = idx.search(queries, k=1, nprobe=4, num_threads=4)
+    np.testing.assert_array_equal(ids[:, 0], selected)
+    np.testing.assert_allclose(distances, 0, rtol=0, atol=1e-5)
+
+    path = str(tmp_path / "hnsw_centroid.index")
+    idx.save(path)
+    loaded = IvfIndex.load(path)
+    loaded_ids, loaded_distances = loaded.search(queries, k=1, nprobe=4, num_threads=4)
+    np.testing.assert_array_equal(loaded_ids, ids)
+    np.testing.assert_array_equal(loaded_distances, distances)
+
+
+def test_hnsw_inner_product_routing_roundtrip(tmp_path):
+    count, dim = 128, 64
+    centroids = np.zeros((count, dim), dtype=np.float32)
+    centroids[:, 0] = 0.5
+    centroids[0, 0] = 100.0
+    data = centroids[:1].copy()
+    query = np.zeros((4, dim), dtype=np.float32)
+    query[:, 0] = 1.0
+    idx = IvfIndex(dim, 1, count, nbits=32, metric="ip", initializer="hnsw")
+    idx.build(data, centroids, np.array([0], dtype=np.uint32), num_threads=4)
+
+    path = str(tmp_path / "hnsw_ip_centroid.index")
+    ids, distances = idx.search(query, k=1, nprobe=1, num_threads=4)
+    assert np.all(ids == 0)
+    np.testing.assert_allclose(distances, -99.0, rtol=0, atol=1e-5)
+    idx.save(path)
+    loaded = IvfIndex.load(path)
+    ids, distances = loaded.search(query, k=1, nprobe=1, num_threads=4)
+    assert np.all(ids == 0)
+    np.testing.assert_allclose(distances, -99.0, rtol=0, atol=1e-5)
+
+
+# ── add / remove ──────────────────────────────────────────────────────────────
+
+
+def _dynamic_index(nbits=4, metric="l2", count=120, dim=65, clusters=3, seed=61):
+    """A small built index plus the points that were not built into it."""
+    rng = np.random.default_rng(seed)
+    data = rng.standard_normal((count * 2, dim)).astype(np.float32)
+    centroids = rng.standard_normal((clusters, dim)).astype(np.float32)
+    if metric == "ip":
+        assigned = np.argmax(data @ centroids.T, axis=1)
+    else:
+        gap = data[:, None, :] - centroids[None, :, :]
+        assigned = np.argmin(np.einsum("ncd,ncd->nc", gap, gap), axis=1)
+    assigned = assigned.astype(np.uint32)
+    idx = IvfIndex(dim, count, clusters, nbits, metric)
+    idx.build(data[:count], centroids, assigned[:count])
+    return idx, data[:count], data[count:], assigned[count:]
+
+
+def test_add_returns_ids_and_makes_points_searchable():
+    idx, old, new, _ = _dynamic_index(nbits=32)
+    added = idx.add(new)
+    assert added.dtype == np.uint32
+    np.testing.assert_array_equal(added, np.arange(len(old), len(old) + len(new)))
+    assert idx.max_elements == len(old) + len(new)
+    # k may now exceed the original point count; raw storage makes the ranking exact.
+    ids, dists = idx.search(new[:3], k=len(old) + len(new), nprobe=3)
+    np.testing.assert_array_equal(ids[:, 0], added[:3])
+    np.testing.assert_allclose(dists[:, 0], 0, atol=1e-4)
+    for row in ids:
+        np.testing.assert_array_equal(np.sort(row), np.arange(len(old) + len(new)))
+
+
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+@pytest.mark.parametrize("nbits", [1, 4, 32])
+def test_add_routing_matches_explicit_cluster_ids(tmp_path, metric, nbits):
+    idx, _, new, assigned = _dynamic_index(nbits=nbits, metric=metric)
+    base = tmp_path / "base.index"
+    idx.save(str(base))
+    saved = {}
+    for name, kwargs in (
+        ("routed", {}),
+        ("explicit", {"cluster_ids": assigned}),
+        ("threaded", {"num_threads": 4}),
+        ("int64", {"cluster_ids": assigned.astype(np.int64)}),
+    ):
+        # Reloading gives each copy the same rotator, so the bytes are comparable.
+        copy = IvfIndex.load(str(base))
+        copy.add(new, **kwargs)
+        path = tmp_path / f"{name}.index"
+        copy.save(str(path))
+        saved[name] = path.read_bytes()
+    assert len(set(saved.values())) == 1
+
+
+def test_add_chunks_match_a_single_add(tmp_path):
+    idx, _, new, assigned = _dynamic_index()
+    base = tmp_path / "base.index"
+    idx.save(str(base))
+    whole = IvfIndex.load(str(base))
+    whole.add(new, assigned)
+    parts = IvfIndex.load(str(base))
+    for chunk in np.array_split(np.arange(len(new)), [1, 33, 34, 90]):
+        ids = parts.add(new[chunk], assigned[chunk])
+        assert len(ids) == len(chunk)
+    a, b = tmp_path / "a.index", tmp_path / "b.index"
+    whole.save(str(a))
+    parts.save(str(b))
+    assert a.read_bytes() == b.read_bytes()
+
+
+@pytest.mark.parametrize("nbits", [1, 4, 32])
+def test_reserved_adds_match_a_single_add(tmp_path, nbits):
+    idx, old, new, assigned = _dynamic_index(nbits=nbits)
+    base = tmp_path / "base.index"
+    idx.save(str(base))
+    whole = IvfIndex.load(str(base))
+    whole.add(new, assigned)
+    parts = IvfIndex.load(str(base))
+    for cluster in range(parts.num_clusters):
+        parts.reserve(cluster, len(old) + len(new))
+    for chunk in np.array_split(np.arange(len(new)), [1, 33, 34, 90]):
+        parts.add(new[chunk], assigned[chunk])
+    a, b = tmp_path / "a.index", tmp_path / "b.index"
+    whole.save(str(a))
+    parts.save(str(b))
+    assert a.read_bytes() == b.read_bytes()
+
+
+def test_reserve_rejects_invalid_arguments():
+    idx, old, _, _ = _dynamic_index()
+    for bad in (-1, 3, 2**32):
+        with pytest.raises(ValueError, match="cluster_id"):
+            idx.reserve(bad, 10)
+    with pytest.raises(ValueError, match="num_points"):
+        idx.reserve(0, -1)
+    with pytest.raises(ValueError, match="supported ID range"):
+        idx.reserve(0, 2**40)
+    idx.reserve(0, 0)
+    assert idx.max_elements == len(old)
+
+    unbuilt = IvfIndex(65, 4, 1, 4)
+    with pytest.raises(RuntimeError, match="trained or loaded"):
+        unbuilt.reserve(0, 1)
+
+
+def test_add_accepts_fast_quantization_and_other_dtypes():
+    idx, _, new, _ = _dynamic_index()
+    idx.add(new[:10].astype(np.float64), fast_quantization=True)
+    assert idx.max_elements == 130
+    assert len(idx.add(new[:0])) == 0
+    assert idx.max_elements == 130
+
+
+def test_add_rejects_invalid_arguments():
+    idx, old, new, assigned = _dynamic_index()
+    with pytest.raises(ValueError, match="dimension"):
+        idx.add(new[:, :10])
+    with pytest.raises(ValueError, match="2D"):
+        idx.add(new[0])
+    with pytest.raises(ValueError, match="length"):
+        idx.add(new, assigned[:-1])
+    for bad in (-1, 3, 2**32):  # 2**32 would wrap to cluster 0 if cast to uint32 first
+        cluster_ids = assigned.astype(np.int64)
+        cluster_ids[0] = bad
+        with pytest.raises(ValueError, match="cluster_ids"):
+            idx.add(new, cluster_ids)
+    assert idx.max_elements == len(old)
+
+    unbuilt = IvfIndex(65, 4, 1, 4)
+    with pytest.raises(RuntimeError, match="trained or loaded"):
+        unbuilt.add(new[:2])
+
+
+# IvfRemoveTest owns the full width x metric x scan-path matrix in C++.
+@pytest.mark.parametrize("nbits", [1, 4, 32])
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+@pytest.mark.parametrize("high_accuracy", [False, True])
+def test_remove_excludes_points_and_survives_reload(
+    tmp_path, nbits, metric, high_accuracy
+):
+    idx, old, new, _ = _dynamic_index(nbits=nbits, metric=metric)
+    count = len(old)
+    queries = new[:5]
+    before_ids, before_dists = idx.search(
+        queries, k=count, nprobe=3, high_accuracy=high_accuracy
+    )
+
+    removed = np.array([0, 5, 6, count - 1, 5])
+    assert idx.remove(removed) == 4
+    assert idx.remove(removed) == 0
+    assert idx.remove([]) == 0
+    assert idx.max_elements == count
+
+    def check(index):
+        ids, dists = index.search(
+            queries, k=count, nprobe=3, high_accuracy=high_accuracy
+        )
+        alive = count - 4
+        for q in range(len(queries)):
+            keep = ~np.isin(before_ids[q], removed)
+            np.testing.assert_array_equal(ids[q, :alive], before_ids[q][keep])
+            np.testing.assert_array_equal(dists[q, :alive], before_dists[q][keep])
+            assert np.all(ids[q, alive:] == np.iinfo(np.uint32).max)
+            assert np.all(np.isinf(dists[q, alive:]))
+        top, top_dists = index.search(
+            queries, k=10, nprobe=3, high_accuracy=high_accuracy
+        )
+        assert not np.isin(top, removed).any()
+        assert np.isfinite(top_dists).all()
+
+    check(idx)
+    path = tmp_path / "removed.index"
+    idx.save(str(path))
+    loaded = IvfIndex.load(str(path))
+    check(loaded)
+    assert loaded.remove(removed) == 0
+
+    # Adding repacks partial batches that contain removed points; they must stay removed.
+    loaded.add(new)
+    idx.add(new)
+    ids, dists = loaded.search(
+        queries, k=count + len(new), nprobe=3, high_accuracy=high_accuracy
+    )
+    assert not np.isin(ids, removed).any()
+    assert np.count_nonzero(ids[0] != np.iinfo(np.uint32).max) == count + len(new) - 4
+
+    # A reloaded index grows exactly like the original.
+    expected_ids, expected_dists = idx.search(
+        queries, k=count + len(new), nprobe=3, high_accuracy=high_accuracy
+    )
+    np.testing.assert_array_equal(ids, expected_ids)
+    np.testing.assert_array_equal(dists, expected_dists)
+
+
+def test_remove_rejects_invalid_ids_without_removing_anything():
+    idx, old, new, _ = _dynamic_index()
+    count = len(old)
+    before = idx.search(new[:3], k=count, nprobe=3)
+    # 2**32 + 1 would wrap to point 1 if it were cast to uint32 first.
+    for bad in (-1, count, 2**32 + 1):
+        with pytest.raises(ValueError, match="ids"):
+            idx.remove([0, 1, bad])
+    with pytest.raises(ValueError, match="1D"):
+        idx.remove(np.zeros((2, 2), dtype=np.int64))
+    after = idx.search(new[:3], k=count, nprobe=3)
+    np.testing.assert_array_equal(before[0], after[0])
+    np.testing.assert_array_equal(before[1], after[1])
+
+    unbuilt = IvfIndex(65, 4, 1, 4)
+    with pytest.raises(RuntimeError, match="trained or loaded"):
+        unbuilt.remove([0])
+
+
+def test_removing_every_point_leaves_a_searchable_index():
+    idx, old, new, _ = _dynamic_index()
+    assert idx.remove(np.arange(len(old))) == len(old)
+    ids, dists = idx.search(new[:2], k=5, nprobe=3)
+    assert np.all(ids == np.iinfo(np.uint32).max)
+    assert np.all(np.isinf(dists))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [2.7],
+        [-0.5],
+        np.array(
+            [1.0, 2.0]
+        ),  # integral floats are refused too: the dtype is the contract
+        np.array([True, False]),  # a boolean mask is not a list of ids
+        ["3"],
+        np.array([1, 2], dtype=object),
+    ],
+)
+def test_remove_and_add_refuse_non_integer_ids(bad):
+    idx, old, new, assigned = _dynamic_index()
+    before = idx.search(new[:3], k=len(old), nprobe=3)
+    with pytest.raises(ValueError, match="integers"):
+        idx.remove(bad)
+    if len(bad) == 2:
+        with pytest.raises(ValueError, match="integers"):
+            idx.add(new[:2], cluster_ids=bad)
+    after = idx.search(new[:3], k=len(old), nprobe=3)
+    np.testing.assert_array_equal(before[0], after[0])
+    assert idx.max_elements == len(old)
+
+
+def test_remove_and_add_accept_any_integer_dtype_and_empty_input():
+    idx, old, new, assigned = _dynamic_index()
+    assert idx.remove([]) == 0
+    assert idx.remove(np.array([], dtype=np.float64)) == 0  # no dtype to check
+    assert idx.remove([1, 2]) == 2
+    assert idx.remove(np.array([3, 4], dtype=np.uint8)) == 2
+    assert idx.remove(np.array([5], dtype=np.int16)) == 1
+    assert len(idx.add(new[:3], cluster_ids=[0, 1, 2])) == 3
+    assert len(idx.add(new[:3], cluster_ids=np.array([0, 1, 2], dtype=np.uint16))) == 3
+
+
+@pytest.mark.parametrize("bits", [1, 4, 32])
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+def test_rebuild_matches_incremental_encoding_with_empty_clusters(
+    tmp_path, bits, metric
+):
+    rng = np.random.default_rng(731)
+    data = rng.standard_normal((130, 65), dtype=np.float32)
+    centers = rng.standard_normal((4, 65), dtype=np.float32)
+    labels = np.full(130, 3, dtype=np.uint32)
+    labels[0] = 1
+    labels[1:33] = 2
+    incremental = IvfIndex(65, 1, 4, nbits=bits, metric=metric)
+    incremental.build(data[:1], centers, labels[:1], num_threads=1)
+    incremental.add(data[1:], cluster_ids=labels[1:], num_threads=1)
+    path = tmp_path / "incremental.index"
+    incremental.save(str(path))
+    expected_bytes = path.read_bytes()
+    expected_ids, expected_distances = incremental.search(data[:3], k=10, nprobe=4)
+    rebuilt = IvfIndex.load(str(path))
+    for threads in (1, 4):
+        rebuilt.build(data, centers, labels, num_threads=threads)
+        rebuilt.save(str(path))
+        assert path.read_bytes() == expected_bytes
+        ids, distances = rebuilt.search(data[:3], k=10, nprobe=4)
+        np.testing.assert_array_equal(ids, expected_ids)
+        np.testing.assert_array_equal(distances, expected_distances)

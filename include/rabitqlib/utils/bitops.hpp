@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -8,7 +10,27 @@
 
 namespace rabitqlib::bitops {
 
-inline unsigned popcount32(uint32_t value) {
+// ISA-specific translation units include these helpers; internal linkage keeps each
+// backend's compiled body from being merged with another backend's.
+
+// Load 1..8 bytes of a compact word, zero-extending a final partial word.
+static inline uint64_t load_word(const void* data, size_t bytes) {
+    if (bytes == 8) {
+        uint64_t word;
+        std::memcpy(&word, data, sizeof(word));
+        return word;
+    }
+    if (bytes == 4) {
+        uint32_t word;
+        std::memcpy(&word, data, sizeof(word));
+        return word;
+    }
+    uint64_t word = 0;
+    std::memcpy(&word, data, bytes);
+    return word;
+}
+
+static inline unsigned popcount32(uint32_t value) {
 #if defined(_MSC_VER)
     value -= (value >> 1) & 0x55555555U;
     value = (value & 0x33333333U) + ((value >> 2) & 0x33333333U);
@@ -18,8 +40,11 @@ inline unsigned popcount32(uint32_t value) {
 #endif
 }
 
-inline unsigned popcount64(uint64_t value) {
-#if defined(_MSC_VER)
+static inline unsigned popcount64(uint64_t value) {
+#if defined(_MSC_VER) || \
+    ((defined(__x86_64__) || defined(__i386__)) && !defined(__POPCNT__))
+    // Inline the software fallback on generic x86 instead of calling libgcc
+    // once per word. ISA-specific builds still use their native instruction.
     value -= (value >> 1) & 0x5555555555555555ULL;
     value = (value & 0x3333333333333333ULL) + ((value >> 2) & 0x3333333333333333ULL);
     return static_cast<unsigned>(
@@ -31,7 +56,7 @@ inline unsigned popcount64(uint64_t value) {
 }
 
 // Callers pass nonzero masks.
-inline unsigned countr_zero32(uint32_t value) {
+static inline unsigned countr_zero32(uint32_t value) {
 #if defined(_MSC_VER)
     unsigned long index = 0;
     _BitScanForward(&index, value);

@@ -25,66 +25,58 @@ float warmup_ip_x0_q_512(
     size_t b_query
 );
 
-template <uint32_t b_query>
-inline float warmup_ip_x0_q(
+namespace detail {
+// Scalar word-interleaved query planes; distinct from the 512-coordinate layout.
+// Internal linkage: ISA-flagged sources include this header.
+static inline float ip_x0_q_impl(
     const uint64_t* data,
     const uint64_t* query,
     float delta,
     float vl,
     size_t padded_dim,
-    [[maybe_unused]] size_t _b_query = 0  // not used
+    size_t b_query
 ) {
     auto num_blk = padded_dim / 64;
-    const auto* it_data = data;
+    const auto* it_data = reinterpret_cast<const uint8_t*>(data);
     const auto* it_query = query;
 
     size_t ip = 0;
     size_t ppc = 0;
 
     for (size_t i = 0; i < num_blk; ++i) {
-        uint64_t x = *static_cast<const uint64_t*>(it_data);
+        const uint64_t x = bitops::load_word(it_data, sizeof(uint64_t));
         ppc += bitops::popcount64(x);
 
         for (size_t j = 0; j < b_query; ++j) {
-            uint64_t y = *static_cast<const uint64_t*>(it_query);
+            const uint64_t y = *it_query;
             ip += (bitops::popcount64(x & y) << j);
-            it_query++;
+            ++it_query;
         }
-        it_data++;
+        it_data += sizeof(uint64_t);
+    }
+
+    if (padded_dim % 64 != 0) {
+        const uint64_t x = bitops::load_word(it_data, (padded_dim % 64) / 8);
+        ppc += bitops::popcount64(x);
+        for (size_t j = 0; j < b_query; ++j) {
+            ip += (bitops::popcount64(x & *it_query) << j);
+            ++it_query;
+        }
     }
 
     return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
 }
+}  // namespace detail
 
-}  // namespace rabitqlib
-
-template <uint32_t b_query, uint32_t padded_dim>
+template <uint32_t BQuery>
 inline float warmup_ip_x0_q(
     const uint64_t* data,
     const uint64_t* query,
     float delta,
     float vl,
-    size_t _padded_dim = 0,  // not used
-    size_t _b_query = 0      // not used
+    size_t padded_dim
 ) {
-    auto num_blk = padded_dim / 64;
-    const auto* it_data = data;
-    const auto* it_query = query;
-
-    size_t ip = 0;
-    size_t ppc = 0;
-
-    for (size_t i = 0; i < num_blk; ++i) {
-        uint64_t x = *static_cast<const uint64_t*>(it_data);
-        ppc += rabitqlib::bitops::popcount64(x);
-
-        for (size_t j = 0; j < b_query; ++j) {
-            uint64_t y = *static_cast<const uint64_t*>(it_query);
-            ip += (rabitqlib::bitops::popcount64(x & y) << j);
-            it_query++;
-        }
-        it_data++;
-    }
-
-    return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
+    return detail::ip_x0_q_impl(data, query, delta, vl, padded_dim, BQuery);
 }
+
+}  // namespace rabitqlib

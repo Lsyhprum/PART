@@ -1,7 +1,7 @@
 #include <array>
 #include <cstddef>
 
-#include "rabitqlib/simd/space_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/space_dispatch.hpp"
 
 namespace rabitqlib::simd {
 namespace {
@@ -19,16 +19,19 @@ float product(const float* a, const float* b, size_t dim) {
     };
     size_t i = 0;
     for (; dim - i >= sums.size(); i += sums.size()) {
-        for (size_t lane = 0; lane < sums.size(); ++lane)
+        for (size_t lane = 0; lane < sums.size(); ++lane) {
             sums[lane] += value(i + lane);
+        }
     }
     for (size_t stride = sums.size() / 2; stride != 0; stride /= 2) {
-        for (size_t lane = 0; lane < stride; ++lane)
+        for (size_t lane = 0; lane < stride; ++lane) {
             sums[lane] += sums[lane + stride];
+        }
     }
     float result = sums[0];
-    for (; i < dim; ++i)
+    for (; i < dim; ++i) {
         result += value(i);
+    }
     return result;
 }
 }  // namespace

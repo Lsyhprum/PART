@@ -4,8 +4,8 @@
 #include <cstdint>
 
 #include "hnsw_neon_kernels.hpp"
-#include "rabitqlib/simd/space_dispatch.hpp"
-#include "rabitqlib/simd/warmup_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/space_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/warmup_dispatch.hpp"
 
 namespace rabitqlib::simd {
 namespace {
@@ -67,7 +67,7 @@ float packed_ip(const float* query, const uint8_t* compact, size_t dim) {
             compact += 2 * Bits;
         }
     } else {
-        for (size_t i = 0; i < dim; i += 64) {
+        for (size_t i = 0; i < dim - dim % 64; i += 64) {
             uint8x16_t c0, c1, c2, c3;
             if constexpr (Bits <= 3) {
                 const uint8x16_t packed = vld1q_u8(compact), mask = vdupq_n_u8(3);
@@ -107,16 +107,32 @@ float packed_ip(const float* query, const uint8_t* compact, size_t dim) {
             compact += 8 * Bits;
         }
     }
+    if constexpr (Bits != 1 && Bits != 4 && Bits != 8) {
+        if (dim % 64 != 0) {
+            // The final 32 codes form a contiguous little-endian bit stream.
+            double tail = 0;
+            for (size_t i = 0; i < 32; ++i) {
+                const size_t offset = i * Bits;
+                unsigned code = compact[offset / 8] >> (offset % 8);
+                if (offset % 8 + Bits > 8) {
+                    code |= unsigned{compact[offset / 8 + 1]} << (8 - offset % 8);
+                }
+                tail +=
+                    static_cast<double>(query[dim - 32 + i]) * (code & ((1U << Bits) - 1));
+            }
+            return sum.result() + static_cast<float>(tail);
+        }
+    }
     return sum.result();
 }
 }  // namespace
 
 namespace excode_ipimpl {
-#define RABITQ_NEON_IP(Block, Bits)                         \
-    float ip##Block##_fxu##Bits##_neon(                     \
-        const float* query, const uint8_t* code, size_t dim \
-    ) {                                                     \
-        return packed_ip<Bits>(query, code, dim);           \
+#define RABITQ_NEON_IP(Block, Bits)                                 \
+    float ip##Block##_fxu##Bits##_neon(                             \
+        const float* query, const uint8_t* compact_code, size_t dim \
+    ) {                                                             \
+        return packed_ip<Bits>(query, compact_code, dim);           \
     }
 RABITQ_NEON_IP(16, 1)
 RABITQ_NEON_IP(64, 2)
@@ -129,32 +145,32 @@ RABITQ_NEON_IP(16, 8)
 #undef RABITQ_NEON_IP
 }  // namespace excode_ipimpl
 
-float mask_ip_x0_q_neon(const float* query, const uint8_t* data, size_t dim) {
-    return detail::mask_ip_neon(query, data, dim);
+float mask_ip_x0_q_neon(const float* query, const uint8_t* data, size_t padded_dim) {
+    return detail::mask_ip_neon(query, data, padded_dim);
 }
-float mask_ip_x0_q_neon(const float* query, const uint64_t* data, size_t dim) {
-    return detail::mask_ip_neon(query, reinterpret_cast<const uint8_t*>(data), dim);
+float mask_ip_x0_q_neon(const float* query, const uint64_t* data, size_t padded_dim) {
+    return detail::mask_ip_neon(query, reinterpret_cast<const uint8_t*>(data), padded_dim);
 }
 float warmup_ip_x0_q_512_neon(
     const uint8_t* data,
     const uint64_t* query,
     float delta,
     float vl,
-    size_t dim,
-    size_t bits
+    size_t padded_dim,
+    size_t b_query
 ) {
-    return detail::warmup_ip_neon(data, query, delta, vl, dim, bits);
+    return detail::warmup_ip_neon(data, query, delta, vl, padded_dim, b_query);
 }
 float warmup_ip_x0_q_512_neon(
     const uint64_t* data,
     const uint64_t* query,
     float delta,
     float vl,
-    size_t dim,
-    size_t bits
+    size_t padded_dim,
+    size_t b_query
 ) {
     return detail::warmup_ip_neon(
-        reinterpret_cast<const uint8_t*>(data), query, delta, vl, dim, bits
+        reinterpret_cast<const uint8_t*>(data), query, delta, vl, padded_dim, b_query
     );
 }
 }  // namespace rabitqlib::simd

@@ -1,15 +1,21 @@
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <string>
 
+#include "rabitqlib/core/detail/eigen.hpp"
+#include "rabitqlib/core/metric.hpp"
 #include "rabitqlib/index/hnsw/hnsw.hpp"
+#include "rabitqlib/index/types.hpp"
 #include "rabitqlib/utils/io.hpp"
 #include "rabitqlib/utils/stopw.hpp"
 
 using PID = rabitqlib::PID;
 using index_type = rabitqlib::hnsw::HierarchicalNSW;
 using data_type = rabitqlib::RowMajorArray<float>;
-using gt_type = rabitqlib::RowMajorArray<uint32_t>;
+using cluster_ids_type = rabitqlib::RowMajorArray<uint32_t>;
 
 int run(int argc, char* argv[]) {
     if (argc < 8) {
@@ -30,7 +36,7 @@ int run(int argc, char* argv[]) {
 
     char* data_file = argv[1];
     char* centroid_file = argv[2];
-    char* cid_file = argv[3];
+    char* cluster_ids_file = argv[3];
     size_t m = atoi(argv[4]);
     size_t ef = atoi(argv[5]);
     size_t total_bits = atoi(argv[6]);
@@ -60,29 +66,29 @@ int run(int argc, char* argv[]) {
 
     data_type data;
     data_type centroids;
-    gt_type cluster_id;
+    cluster_ids_type cluster_ids;
 
     rabitqlib::load_vecs<float, data_type>(data_file, data);
     rabitqlib::load_vecs<float, data_type>(centroid_file, centroids);
-    rabitqlib::load_vecs<uint32_t, gt_type>(cid_file, cluster_id);
+    rabitqlib::load_vecs<uint32_t, cluster_ids_type>(cluster_ids_file, cluster_ids);
 
     size_t num_points = data.rows();
     size_t dim = data.cols();
 
     size_t random_seed = 100;  // by default 100
-    auto* hnsw = new rabitqlib::hnsw::HierarchicalNSW(
+    rabitqlib::hnsw::HierarchicalNSW hnsw(
         num_points, dim, total_bits, m, ef, random_seed, metric_type
     );
 
     rabitqlib::StopW stopw;
     stopw.reset();
 
-    hnsw->construct(
+    hnsw.construct(
         centroids.rows(),
         centroids.data(),
         num_points,
         data.data(),
-        cluster_id.data(),
+        cluster_ids.data(),
         0,
         faster_quant
     );
@@ -91,7 +97,7 @@ int run(int argc, char* argv[]) {
     total_time /= 1e6;
 
     std::cout << "indexing time = " << total_time << "s" << '\n';
-    hnsw->save(index_file);
+    hnsw.save(index_file);
 
     std::cout << "index saved..." << '\n';
 

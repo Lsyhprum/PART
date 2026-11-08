@@ -1,0 +1,877 @@
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "rabitqlib/core/data_layout.hpp"
+#include "rabitqlib/core/detail/fast_scale_table.hpp"
+#include "rabitqlib/core/detail/rabitq_impl.hpp"
+#include "rabitqlib/core/encoder.hpp"
+#include "rabitqlib/core/estimator.hpp"
+#include "rabitqlib/core/metric.hpp"
+#include "rabitqlib/core/query.hpp"
+#include "rabitqlib/utils/space.hpp"
+#include "rabitqlib/utils/warmup_space.hpp"
+
+namespace rabitqlib::quant {
+namespace {
+
+struct DispatchedEstimateKernel {
+    static constexpr auto mask_ip_x0_q =
+        static_cast<float (*)(const float*, const uint64_t*, size_t)>(
+            &rabitqlib::mask_ip_x0_q
+        );
+    static constexpr auto warmup_ip_x0_q_512 = static_cast<
+        float (*)(const uint64_t*, const uint64_t*, float, float, size_t, size_t)>(
+        &rabitqlib::warmup_ip_x0_q_512
+    );
+};
+
+TEST(SingleEstimatorTest, NamedResultsPreserveLegacyOutputOrder) {
+    const auto check = [](const auto& result, float distance, float lower, float ip) {
+        EXPECT_EQ(result.distance, distance);
+        EXPECT_EQ(result.lower_bound, lower);
+        EXPECT_EQ(result.inner_product, ip);
+    };
+    for (size_t dim : {64U, 96U}) {
+        std::vector<float> data(dim), centroid(dim), query(dim);
+        for (size_t i = 0; i < dim; ++i) {
+            data[i] = static_cast<float>(i % 11) * 0.25F;
+            centroid[i] = static_cast<float>(i % 3) * 0.125F;
+            query[i] = static_cast<float>(i % 7) * -0.25F;
+        }
+        for (auto metric : {METRIC_L2, METRIC_IP}) {
+            const float g_add = metric == METRIC_L2 ? 9.0F : -2.0F;
+            constexpr float kGError = 3.0F;
+            for (size_t bits = 1; bits <= 9; ++bits) {
+                const size_t ex_bits = bits - 1;
+                std::vector<char> bin(BinDataMap<float>::data_bytes(dim));
+                std::vector<char> extra(ExDataMap<float>::data_bytes(dim, ex_bits));
+                quantize_split_single(
+                    data.data(),
+                    centroid.data(),
+                    dim,
+                    ex_bits,
+                    bin.data(),
+                    extra.data(),
+                    metric
+                );
+                SplitSingleQuery<float> prepared(
+                    query.data(), dim, ex_bits, RabitqConfig{}, metric
+                );
+                float distance, lower, ip;
+                split_single_estdist(
+                    bin.data(), prepared, dim, ip, distance, lower, g_add, kGError
+                );
+                check(
+                    estimate_split_single(bin.data(), prepared, dim, g_add, kGError),
+                    distance,
+                    lower,
+                    ip
+                );
+                split_single_estdist_direct<DispatchedEstimateKernel>(
+                    bin.data(), prepared, dim, ip, distance, lower, g_add, kGError
+                );
+                check(
+                    estimate_split_single_direct<DispatchedEstimateKernel>(
+                        bin.data(), prepared, dim, g_add, kGError
+                    ),
+                    distance,
+                    lower,
+                    ip
+                );
+                if (ex_bits == 0) {
+                    continue;
+                }
+                auto ip_func = select_excode_ipfunc(ex_bits);
+                split_single_fulldist(
+                    bin.data(),
+                    extra.data(),
+                    ip_func,
+                    prepared,
+                    dim,
+                    ex_bits,
+                    distance,
+                    lower,
+                    ip,
+                    g_add,
+                    kGError
+                );
+                check(
+                    estimate_split_single_full(
+                        bin.data(),
+                        extra.data(),
+                        ip_func,
+                        prepared,
+                        dim,
+                        ex_bits,
+                        g_add,
+                        kGError
+                    ),
+                    distance,
+                    lower,
+                    ip
+                );
+                split_single_fulldist_direct<DispatchedEstimateKernel>(
+                    bin.data(),
+                    extra.data(),
+                    ip_func,
+                    prepared,
+                    dim,
+                    ex_bits,
+                    distance,
+                    lower,
+                    ip,
+                    g_add,
+                    kGError
+                );
+                check(
+                    estimate_split_single_full_direct<DispatchedEstimateKernel>(
+                        bin.data(),
+                        extra.data(),
+                        ip_func,
+                        prepared,
+                        dim,
+                        ex_bits,
+                        g_add,
+                        kGError
+                    ),
+                    distance,
+                    lower,
+                    ip
+                );
+            }
+            for (auto widths :
+                 {std::pair<size_t, size_t>{1, 0}, {1, 4}, {4, 0}, {4, 4}, {8, 1}}) {
+                const auto [base_bits, ex_bits] = widths;
+                std::vector<char> base(BaseDataMap<float>::data_bytes(dim, base_bits));
+                std::vector<char> extra(ExDataMap<float>::data_bytes(dim, ex_bits));
+                quantize_xy_single(
+                    data.data(),
+                    centroid.data(),
+                    dim,
+                    base_bits,
+                    ex_bits,
+                    base.data(),
+                    extra.data(),
+                    metric
+                );
+                SplitSingleQuery<float> prepared(
+                    query.data(), dim, ex_bits, RabitqConfig{}, metric, base_bits
+                );
+                auto base_ip = select_excode_ipfunc(base_bits);
+                auto extra_ip = select_excode_ipfunc(ex_bits);
+                float distance, lower, ip;
+                xy_single_base_dist(
+                    base.data(),
+                    base_ip,
+                    prepared,
+                    dim,
+                    base_bits,
+                    ip,
+                    distance,
+                    lower,
+                    g_add,
+                    kGError
+                );
+                check(
+                    estimate_xy_base(
+                        base.data(), base_ip, prepared, dim, base_bits, g_add, kGError
+                    ),
+                    distance,
+                    lower,
+                    ip
+                );
+                xy_single_full_dist(
+                    base.data(),
+                    extra.data(),
+                    base_ip,
+                    extra_ip,
+                    prepared,
+                    dim,
+                    base_bits,
+                    ex_bits,
+                    distance,
+                    lower,
+                    ip,
+                    g_add,
+                    kGError
+                );
+                check(
+                    estimate_xy_full(
+                        base.data(),
+                        extra.data(),
+                        base_ip,
+                        extra_ip,
+                        prepared,
+                        dim,
+                        base_bits,
+                        ex_bits,
+                        g_add,
+                        kGError
+                    ),
+                    distance,
+                    lower,
+                    ip
+                );
+            }
+        }
+    }
+}
+
+int level_from_thresholds(double magnitude, double t, int max_code) {
+    int result = 0;
+    if (magnitude > 0) {
+        for (int level = 1; level <= max_code; ++level) {
+            if (static_cast<double>(level) / magnitude <= t) {
+                result = level;
+            }
+        }
+    }
+    return result;
+}
+
+template <typename T>
+double sorted_event_rescale_factor(const std::vector<T>& magnitudes, size_t bits) {
+    if (magnitudes.empty()) {
+        return 0;
+    }
+    const double max_o = *std::max_element(magnitudes.begin(), magnitudes.end());
+    if (max_o == 0) {
+        return 0;
+    }
+
+    const int max_code = (1 << bits) - 1;
+    const double end = static_cast<double>(max_code + 10) / max_o;
+    const double start = end * rabitq_impl::ex_bits::kTightStart[bits];
+    std::vector<int> levels(magnitudes.size());
+    std::vector<std::pair<double, size_t>> events;
+    double denominator = static_cast<double>(magnitudes.size()) * 0.25;
+    double numerator = 0;
+    for (size_t i = 0; i < magnitudes.size(); ++i) {
+        const double magnitude = magnitudes[i];
+        const int level = level_from_thresholds(magnitude, start, max_code);
+        levels[i] = level;
+        denominator += (level * level) + level;
+        numerator += (level + 0.5) * magnitude;
+        if (magnitude > 0) {
+            for (int next = level + 1; next <= max_code; ++next) {
+                const double threshold = static_cast<double>(next) / magnitude;
+                if (threshold < end) {
+                    events.emplace_back(threshold, i);
+                }
+            }
+        }
+    }
+    // Sorting all legal events independently checks heap ordering, including ties.
+    std::sort(events.begin(), events.end());
+    double best_t = start;
+    double best_ip = numerator / std::sqrt(denominator);
+    for (size_t event = 0; event < events.size();) {
+        const double threshold = events[event].first;
+        do {
+            const size_t i = events[event++].second;
+            denominator += 2.0 * ++levels[i];
+            numerator += static_cast<double>(magnitudes[i]);
+        } while (event < events.size() && events[event].first == threshold);
+        const double ip = numerator / std::sqrt(denominator);
+        if (ip > best_ip) {
+            best_ip = ip;
+            best_t = threshold;
+        }
+    }
+    return best_t;
+}
+
+template <typename T>
+void check_rescale_search_against_sorted_events() {
+    for (size_t dim : {0U, 1U, 2U, 3U, 7U, 31U, 64U, 65U}) {
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            std::vector<T> magnitudes(dim);
+            uint32_t state = 42;
+            double norm_sq = 0;
+            for (size_t i = 0; i < dim; ++i) {
+                double value = 0;
+                if (pattern == 1) {
+                    value = i == dim / 2 ? 1 : 0;
+                } else if (pattern == 2) {
+                    value = static_cast<double>(i % 4);
+                } else if (pattern == 3) {
+                    state = state * 1664525U + 1013904223U;
+                    value = i % 5 == 0 ? 0 : 1.0 + (state >> 16U);
+                }
+                magnitudes[i] = static_cast<T>(value);
+                norm_sq += value * value;
+            }
+            if (norm_sq > 0) {
+                const double norm = std::sqrt(norm_sq);
+                for (T& magnitude : magnitudes) {
+                    magnitude = static_cast<T>(static_cast<double>(magnitude) / norm);
+                }
+            }
+            for (size_t bits = 0; bits <= 8; ++bits) {
+                SCOPED_TRACE(
+                    ::testing::Message() << "sizeof(T)=" << sizeof(T) << " dim=" << dim
+                                         << " pattern=" << pattern << " bits=" << bits
+                );
+                const double expected_t = sorted_event_rescale_factor(magnitudes, bits);
+                EXPECT_EQ(
+                    rabitq_impl::ex_bits::best_rescale_factor(magnitudes.data(), dim, bits),
+                    expected_t
+                );
+                std::vector<uint8_t> expected_code(dim);
+                double ipnorm = 0;
+                for (size_t i = 0; i < dim; ++i) {
+                    const double magnitude = magnitudes[i];
+                    const int level =
+                        level_from_thresholds(magnitude, expected_t, (1 << bits) - 1);
+                    expected_code[i] = static_cast<uint8_t>(level);
+                    ipnorm += (level + 0.5) * magnitude;
+                }
+                T expected_factor = ipnorm == 0 ? T{1} : static_cast<T>(1.0 / ipnorm);
+                if (!std::isnormal(expected_factor)) {
+                    expected_factor = T{1};
+                }
+                std::vector<uint8_t> code(dim, 0xFF);
+                const T factor = rabitq_impl::ex_bits::quantize_ex(
+                    magnitudes.data(), code.data(), dim, bits
+                );
+                EXPECT_EQ(code, expected_code);
+                EXPECT_EQ(factor, expected_factor);
+            }
+        }
+    }
+}
+
+TEST(RabitqRescaleSearchTest, MatchesSortedLegalEventsExactly) {
+    check_rescale_search_against_sorted_events<float>();
+    check_rescale_search_against_sorted_events<double>();
+}
+
+TEST(RabitqQuantizedLevelTest, MatchesThresholdsAroundRoundingBoundaries) {
+    const std::array<double, 7> magnitudes = {
+        0.1,
+        0.3,
+        1.0 / 3.0,
+        std::nextafter(1.0, 0.0),
+        1.0,
+        static_cast<double>(std::numeric_limits<float>::denorm_min()),
+        std::numeric_limits<double>::max()};
+    for (int bits = 0; bits <= 8; ++bits) {
+        const int max_code = (1 << bits) - 1;
+        EXPECT_EQ(rabitq_impl::ex_bits::quantized_level_at_scale(0, 1, max_code), 0);
+        for (double magnitude : magnitudes) {
+            for (int level = 1; level <= max_code + 1; ++level) {
+                const double threshold = static_cast<double>(level) / magnitude;
+                for (double t :
+                     {std::nextafter(threshold, 0.0),
+                      threshold,
+                      std::nextafter(threshold, std::numeric_limits<double>::infinity())}) {
+                    // Enumerate crossed thresholds independently of t * magnitude.
+                    int expected = 0;
+                    for (int code = 1; code <= max_code; ++code) {
+                        if (static_cast<double>(code) / magnitude <= t) {
+                            expected = code;
+                        }
+                    }
+                    EXPECT_EQ(
+                        rabitq_impl::ex_bits::quantized_level_at_scale(
+                            magnitude, t, max_code
+                        ),
+                        expected
+                    ) << "bits="
+                      << bits << " magnitude=" << magnitude << " t=" << t;
+                }
+            }
+        }
+    }
+}
+
+TEST(RabitqRescaleSearchTest, SaturatedAndZeroCoordinatesHaveNoFurtherEvents) {
+    const std::array<double, 2> magnitudes = {1.0, 0.0};
+    std::array<int, 2> code{};
+    const double start = 17.0 * rabitq_impl::ex_bits::kTightStart[3];
+
+    EXPECT_DOUBLE_EQ(
+        rabitq_impl::ex_bits::best_rescale_factor(magnitudes.data(), magnitudes.size(), 3),
+        start
+    );
+    const double factor = rabitq_impl::ex_bits::quantize_ex(
+        magnitudes.data(), code.data(), magnitudes.size(), 3
+    );
+    EXPECT_EQ(code, (std::array<int, 2>{7, 0}));
+    EXPECT_DOUBLE_EQ(factor, 1.0 / 7.5);
+}
+
+TEST(RabitqRescaleSearchTest, KeepsInitialStateWhenLaterLegalStateIsWorse) {
+    const std::array<double, 2> magnitudes = {0.8, 0.6};
+    std::array<int, 2> code{};
+    const double start = (17.0 / 0.8) * rabitq_impl::ex_bits::kTightStart[3];
+
+    // The later event at 7 / 0.6 yields [7, 7], which has lower cosine similarity.
+    EXPECT_DOUBLE_EQ(
+        rabitq_impl::ex_bits::best_rescale_factor(magnitudes.data(), magnitudes.size(), 3),
+        start
+    );
+    const double factor = rabitq_impl::ex_bits::quantize_ex(
+        magnitudes.data(), code.data(), magnitudes.size(), 3
+    );
+    EXPECT_EQ(code, (std::array<int, 2>{7, 6}));
+    EXPECT_DOUBLE_EQ(factor, 1.0 / (7.5 * 0.8 + 6.5 * 0.6));
+}
+
+TEST(RabitqRescaleSearchTest, EmitsAllCoordinatesCrossingTheSelectedThreshold) {
+    for (size_t small_coordinate = 0; small_coordinate < 3; ++small_coordinate) {
+        std::array<double, 3> magnitudes = {2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0};
+        magnitudes[small_coordinate] = 1.0 / 3.0;
+        std::array<int, 3> expected = {3, 3, 3};
+        expected[small_coordinate] = 1;
+        std::array<int, 3> code{};
+
+        // Both larger coordinates cross into level 3 at exactly t = 4.5.
+        EXPECT_DOUBLE_EQ(
+            rabitq_impl::ex_bits::best_rescale_factor(
+                magnitudes.data(), magnitudes.size(), 2
+            ),
+            4.5
+        );
+        const double factor = rabitq_impl::ex_bits::quantize_ex(
+            magnitudes.data(), code.data(), magnitudes.size(), 2
+        );
+        EXPECT_EQ(code, expected);
+        EXPECT_DOUBLE_EQ(factor, 6.0 / 31.0);
+    }
+}
+
+TEST(RabitqDegenerateInputTest, OneBitFactorsAreFiniteForZeroResidual) {
+    constexpr size_t kDim = 64;
+    std::array<float, kDim> data{};
+    std::array<float, kDim> centroid{};
+    std::array<int, kDim> code{};
+
+    for (MetricType metric : {METRIC_L2, METRIC_IP}) {
+        float f_add = 0;
+        float f_rescale = 0;
+        float f_error = 0;
+        rabitq_impl::one_bit::one_bit_code_with_factor(
+            data.data(),
+            centroid.data(),
+            kDim,
+            code.data(),
+            f_add,
+            f_rescale,
+            f_error,
+            metric
+        );
+
+        EXPECT_TRUE(std::isfinite(f_add));
+        EXPECT_TRUE(std::isfinite(f_rescale));
+        EXPECT_FLOAT_EQ(f_error, 0.0F);
+    }
+}
+
+TEST(RabitqDegenerateInputTest, ExtraBitFactorsAreFiniteForZeroResidual) {
+    constexpr size_t kDim = 64;
+    std::array<float, kDim> data{};
+    std::array<float, kDim> centroid{};
+    std::array<uint8_t, kDim> code{};
+    float f_add = 0;
+    float f_rescale = 0;
+    float f_error = 0;
+
+    rabitq_impl::ex_bits::ex_bits_code_with_factor(
+        data.data(), centroid.data(), kDim, 3, code.data(), f_add, f_rescale, f_error
+    );
+
+    EXPECT_TRUE(std::isfinite(f_add));
+    EXPECT_TRUE(std::isfinite(f_rescale));
+    EXPECT_FLOAT_EQ(f_error, 0.0F);
+}
+
+TEST(RabitqDegenerateInputTest, FullFactorsAreFiniteForCollinearResidual) {
+    constexpr size_t kDim = 512;
+    std::array<float, kDim> data;
+    data.fill(0.1F);
+    const std::array<float, kDim> centroid{};
+    std::array<uint16_t, kDim> code{};
+
+    // Equal coordinates make the residual and quantized direction collinear.
+    // Their theoretically zero error must remain finite despite norm/dot rounding.
+    for (MetricType metric : {METRIC_L2, METRIC_IP}) {
+        for (size_t bits = 1; bits <= 9; ++bits) {
+            SCOPED_TRACE(
+                ::testing::Message()
+                << "metric=" << static_cast<int>(metric) << " bits=" << bits
+            );
+            float f_add = 0;
+            float f_rescale = 0;
+            float f_error = 0;
+            quantize_full_single(
+                data.data(),
+                centroid.data(),
+                kDim,
+                bits,
+                code.data(),
+                f_add,
+                f_rescale,
+                f_error,
+                metric
+            );
+            EXPECT_TRUE(std::isfinite(f_add));
+            EXPECT_TRUE(std::isfinite(f_rescale));
+            EXPECT_TRUE(std::isfinite(f_error));
+            EXPECT_GE(f_error, 0.0F);
+        }
+    }
+}
+
+TEST(RabitqDegenerateInputTest, ScalarQuantizationReconstructsZeroVector) {
+    constexpr size_t kDim = 64;
+    std::array<float, kDim> data{};
+    std::array<uint8_t, kDim> code{};
+    std::array<float, kDim> reconstructed{};
+    float delta = 1;
+    float vl = 1;
+
+    quantize_scalar(data.data(), kDim, 4, code.data(), delta, vl);
+    reconstruct_vec(code.data(), delta, vl, kDim, reconstructed.data());
+
+    EXPECT_TRUE(std::isfinite(delta));
+    EXPECT_TRUE(std::isfinite(vl));
+    EXPECT_EQ(reconstructed, data);
+}
+
+TEST(RabitqOneBitTest, FullQuantizationInitializesCodesAndFactors) {
+    constexpr size_t kDim = 64;
+    std::array<float, kDim> data{};
+    std::array<uint8_t, kDim> code;
+    code.fill(0xFF);
+    data[0] = 1.0F;
+    float f_add = std::numeric_limits<float>::quiet_NaN();
+    float f_rescale = std::numeric_limits<float>::quiet_NaN();
+    float f_error = std::numeric_limits<float>::quiet_NaN();
+
+    quantize_full_single(data.data(), kDim, 1, code.data(), f_add, f_rescale, f_error);
+
+    EXPECT_EQ(code[0], 1);
+    for (size_t i = 1; i < kDim; ++i) {
+        EXPECT_EQ(code[i], 0);
+    }
+    EXPECT_TRUE(std::isfinite(f_add));
+    EXPECT_TRUE(std::isfinite(f_rescale));
+    EXPECT_TRUE(std::isfinite(f_error));
+}
+
+TEST(RabitqFullQuantizationTest, ReconstructsFromCodeAndEstimatorFactors) {
+    constexpr size_t kDim = 64;
+    constexpr size_t kBits = 4;
+    std::array<float, kDim> data{};
+    std::array<float, kDim> centroid{};
+    std::array<uint8_t, kDim> code{};
+    std::array<float, kDim> reconstructed{};
+    for (size_t i = 0; i < kDim; ++i) {
+        data[i] = static_cast<float>(i % 11) - 5.0F;
+        centroid[i] = static_cast<float>(i % 3) * 0.25F;
+    }
+
+    float f_add = 0;
+    float f_rescale = 0;
+    float f_error = 0;
+    quantize_full_single(
+        data.data(), centroid.data(), kDim, kBits, code.data(), f_add, f_rescale, f_error
+    );
+    reconstruct_full_vec(
+        code.data(), centroid.data(), kDim, kBits, f_rescale, reconstructed.data()
+    );
+
+    const float code_center = -static_cast<float>((1 << kBits) - 1) / 2;
+    const float scale = -f_rescale / 2;
+    for (size_t i = 0; i < kDim; ++i) {
+        EXPECT_FLOAT_EQ(
+            reconstructed[i],
+            centroid[i] + scale * (static_cast<float>(code[i]) + code_center)
+        );
+    }
+}
+
+// An exactly-zero residual coordinate must be encoded consistently by both halves of
+// the split code. one_bit_code_with_factor() uses (residual > 0) and so calls zero
+// negative; if ex_bits_code() calls it positive, the assembled code lands 2^ex_bits away
+// from where the factors assume it is. The <c*xu_cb, r> == ||r||^2 invariant cannot see
+// this, because a zero coordinate contributes nothing to that inner product.
+TEST(RabitqSignConventionTest, ZeroResidualCoordinateGetsSmallestMagnitudeCode) {
+    constexpr size_t kDim = 64;
+    constexpr size_t kTotalBits = 8;
+    constexpr size_t kExBits = kTotalBits - 1;
+
+    std::array<float, kDim> data{};
+    for (size_t i = 0; i < kDim; ++i) {
+        data[i] = static_cast<float>(i % 7) - 3.0F;  // zero at i % 7 == 3
+    }
+
+    std::array<uint8_t, kDim> code{};
+    float f_add = 0;
+    float f_rescale = 0;
+    float f_error = 0;
+    quantize_full_single(
+        data.data(), kDim, kTotalBits, code.data(), f_add, f_rescale, f_error
+    );
+
+    // centered code is code + cb, cb = -(2^total_bits - 1)/2
+    const float cb = -((1 << kExBits) - 0.5F);
+    size_t n_zero = 0;
+    for (size_t i = 0; i < kDim; ++i) {
+        if (data[i] != 0.0F) {
+            continue;
+        }
+        ++n_zero;
+        EXPECT_FLOAT_EQ(static_cast<float>(code[i]) + cb, -0.5F)
+            << "zero residual at dim " << i << " encoded as " << +code[i];
+    }
+    ASSERT_GT(n_zero, 0U) << "test vector must contain exact zeros";
+}
+
+TEST(RabitqSignConventionTest, ZeroResidualDoesNotInflateReconstructionNorm) {
+    constexpr size_t kDim = 64;
+    constexpr size_t kTotalBits = 8;
+    constexpr size_t kExBits = kTotalBits - 1;
+
+    std::array<float, kDim> data{};
+    for (size_t i = 0; i < kDim; ++i) {
+        data[i] = static_cast<float>((i * 37) % 23) - 11.0F;  // zeros at rem 11
+    }
+
+    std::array<uint8_t, kDim> code{};
+    float f_add = 0;
+    float f_rescale = 0;
+    float f_error = 0;
+    quantize_full_single(
+        data.data(), kDim, kTotalBits, code.data(), f_add, f_rescale, f_error
+    );
+
+    const double cb = -((1 << kExBits) - 0.5);
+    const double c = f_rescale / -2.0;
+    double nsq = 0;
+    double qq = 0;
+    size_t n_zero = 0;
+    for (size_t i = 0; i < kDim; ++i) {
+        const double q = static_cast<double>(code[i]) + cb;
+        nsq += static_cast<double>(data[i]) * data[i];
+        qq += q * q;
+        n_zero += (data[i] == 0.0F);
+    }
+    ASSERT_GT(n_zero, 0U) << "test vector must contain exact zeros";
+
+    // ||c*xu_cb||^2 / ||r||^2 - 1 == tan^2 of the angle between the residual and its
+    // reconstruction. A mismatched sign convention inflates this by orders of magnitude.
+    const double tan_sq = ((c * c * qq) / nsq) - 1.0;
+    EXPECT_LT(tan_sq, 1e-3) << "reconstruction norm inflated, tan^2 = "
+                            << std::to_string(tan_sq);
+}
+
+TEST(RabitqPreconditionTest, EncodersRejectSingleDimensionInput) {
+    const std::array<float, 1> data{0.5F};
+    const std::array<float, 1> centroid{0.0F};
+    std::array<uint16_t, 1> code{};
+    float f_add = 0;
+    float f_rescale = 0;
+    float f_error = 0;
+    // code_factor_terms divides by dim - 1; every advanced encoder reaches it.
+    EXPECT_THROW(
+        quantize_full_single(
+            data.data(), centroid.data(), 1, 4, code.data(), f_add, f_rescale, f_error
+        ),
+        std::invalid_argument
+    );
+    EXPECT_THROW(
+        quantize_full_single(data.data(), 1, 1, code.data(), f_add, f_rescale, f_error),
+        std::invalid_argument
+    );
+}
+
+TEST(RabitqPreconditionTest, FullCodeRejectsBitWidthsTheElementTypeCannotHold) {
+    constexpr size_t kDim = 64;
+    std::array<float, kDim> data;
+    data.fill(0.25F);
+    const std::array<float, kDim> centroid{};
+    std::array<uint8_t, kDim> narrow{};
+    std::array<uint16_t, kDim> wide{};
+    float f_add = 0;
+    float f_rescale = 0;
+    float f_error = 0;
+    // Nine bits (sign plus eight magnitude bits) need more than eight bits per code.
+    EXPECT_THROW(
+        quantize_full_single(
+            data.data(), centroid.data(), kDim, 9, narrow.data(), f_add, f_rescale, f_error
+        ),
+        std::invalid_argument
+    );
+    EXPECT_NO_THROW(quantize_full_single(
+        data.data(), centroid.data(), kDim, 8, narrow.data(), f_add, f_rescale, f_error
+    ));
+    EXPECT_NO_THROW(quantize_full_single(
+        data.data(), centroid.data(), kDim, 9, wide.data(), f_add, f_rescale, f_error
+    ));
+    for (size_t bits : {0U, 10U}) {
+        EXPECT_THROW(
+            quantize_full_single(
+                data.data(),
+                centroid.data(),
+                kDim,
+                bits,
+                wide.data(),
+                f_add,
+                f_rescale,
+                f_error
+            ),
+            std::invalid_argument
+        );
+    }
+}
+
+TEST(RabitqPreconditionTest, SplitSingleQueryRequiresPaddedDimensionMultipleOf32) {
+    std::vector<float> query(96, 0.5F);
+    for (size_t padded_dim : {0U, 16U, 48U, 95U}) {
+        SCOPED_TRACE(padded_dim);
+        EXPECT_THROW(
+            (SplitSingleQuery<float>(query.data(), padded_dim, 3, RabitqConfig{})),
+            std::invalid_argument
+        );
+    }
+    for (size_t padded_dim : {32U, 64U, 96U}) {
+        SCOPED_TRACE(padded_dim);
+        EXPECT_NO_THROW(
+            (SplitSingleQuery<float>(query.data(), padded_dim, 3, RabitqConfig{}))
+        );
+    }
+}
+
+TEST(FastScaleTableTest, FasterConfigReadsTheFrozenTable) {
+    // Pinned table entries; these hold on every platform because they are data.
+    EXPECT_EQ(faster_config(768, 4).t_const, 0x1.4c76161b7a4b6p+6);
+    EXPECT_EQ(faster_config(64, 9).t_const, 0x1.8a0b920d378c3p+9);
+    EXPECT_EQ(
+        faster_config(768, 4).t_const,
+        rabitq_impl::ex_bits::frozen_const_scaling_factor(768, 3).value()
+    );
+    // One bit needs no scale and keeps the default configuration.
+    EXPECT_EQ(faster_config(768, 1).t_const, RabitqConfig().t_const);
+}
+
+TEST(FastScaleTableTest, FrozenValuesMatchTheComputation) {
+    for (size_t padded_dim : {32U, 64U, 96U, 800U}) {
+        for (size_t ex_bits = 1; ex_bits <= rabitq_impl::ex_bits::kFastScaleMaxExBits;
+             ++ex_bits) {
+            SCOPED_TRACE(::testing::Message() << padded_dim << ", " << ex_bits);
+            const double frozen =
+                rabitq_impl::ex_bits::frozen_const_scaling_factor(padded_dim, ex_bits)
+                    .value();
+            const double computed =
+                rabitq_impl::ex_bits::const_scaling_factor(padded_dim, ex_bits);
+#if defined(__GLIBCXX__) && defined(__x86_64__) && !defined(__AVX__) && !defined(__FMA__)
+            // The configuration the table was generated in reproduces it exactly, which
+            // shows the table was generated faithfully. If this fails after a deliberate
+            // change to const_scaling_factor, relax it to the tolerance below; never
+            // regenerate the table, which is frozen data.
+            EXPECT_EQ(frozen, computed);
+#else
+            // Other standard libraries draw different samples (several percent apart)
+            // and FMA or AVX builds differ in the last bits, so this only checks the
+            // value is plausible. The table removes those differences from faster_config.
+            EXPECT_NEAR(frozen, computed, 1e-1 * frozen);
+#endif
+        }
+    }
+}
+
+TEST(FastScaleTableTest, WholeTableIsFrozen) {
+    // FNV-1a over every entry's IEEE-754 bits, least significant byte first, in
+    // padded_dim-major order. Any edited, dropped or reordered entry changes it.
+    using rabitq_impl::ex_bits::frozen_const_scaling_factor;
+    using rabitq_impl::ex_bits::kFastScaleDimStep;
+    using rabitq_impl::ex_bits::kFastScaleMaxDim;
+    using rabitq_impl::ex_bits::kFastScaleMaxExBits;
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t padded_dim = kFastScaleDimStep; padded_dim <= kFastScaleMaxDim;
+         padded_dim += kFastScaleDimStep) {
+        for (size_t ex_bits = 1; ex_bits <= kFastScaleMaxExBits; ++ex_bits) {
+            const double scale = frozen_const_scaling_factor(padded_dim, ex_bits).value();
+            uint64_t bits = 0;
+            std::memcpy(&bits, &scale, sizeof(bits));
+            for (size_t byte = 0; byte < sizeof(bits); ++byte) {
+                hash ^= (bits >> (8 * byte)) & 0xFFU;
+                hash *= 1099511628211ULL;
+            }
+        }
+    }
+    EXPECT_EQ(hash, 0x0e2905a5a51a323eULL);
+}
+
+TEST(FastScaleTableTest, DimensionsOutsideTheTableFallBackToTheComputation) {
+    using rabitq_impl::ex_bits::frozen_const_scaling_factor;
+    EXPECT_FALSE(frozen_const_scaling_factor(0, 3).has_value());
+    EXPECT_FALSE(frozen_const_scaling_factor(50, 3).has_value());
+    EXPECT_FALSE(frozen_const_scaling_factor(65536 + 32, 3).has_value());
+    EXPECT_FALSE(frozen_const_scaling_factor(64, 0).has_value());
+    EXPECT_FALSE(frozen_const_scaling_factor(64, 9).has_value());
+    EXPECT_GT(frozen_const_scaling_factor(65536, 8).value(), 0);
+    EXPECT_EQ(
+        faster_config(50, 4).t_const, rabitq_impl::ex_bits::const_scaling_factor(50, 3)
+    );
+}
+
+}  // namespace
+}  // namespace rabitqlib::quant
+
+TEST(RabitqCompactCodesTest, WordTailsUseCompactRowStrides) {
+    using namespace rabitqlib;
+    for (size_t dim : {96U, 160U}) {
+        constexpr size_t kCount = 3;
+        std::vector<float> data(kCount * dim), centroid(dim, 0);
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<int>(i % 17) - 8;
+        }
+        for (auto metric : {METRIC_L2, METRIC_IP}) {
+            std::vector<uint8_t> expected(kCount * dim / 8 + 1, 0xA5), actual = expected;
+            std::vector<float> add(kCount), rescale(kCount), error(kCount);
+            std::vector<float> batch_add(kCount), batch_rescale(kCount),
+                batch_error(kCount);
+            for (size_t i = 0; i < kCount; ++i) {
+                quant::rabitq_impl::one_bit::one_bit_compact_code_to_bytes<float, uint64_t>(
+                    data.data() + i * dim,
+                    centroid.data(),
+                    dim,
+                    expected.data() + i * dim / 8,
+                    add[i],
+                    rescale[i],
+                    error[i],
+                    metric
+                );
+            }
+            quant::rabitq_impl::one_bit::one_bit_compact_codes<float, uint64_t>(
+                data.data(),
+                centroid.data(),
+                kCount,
+                dim,
+                reinterpret_cast<uint64_t*>(actual.data()),
+                batch_add.data(),
+                batch_rescale.data(),
+                batch_error.data(),
+                metric
+            );
+            EXPECT_EQ(actual, expected);
+            EXPECT_EQ(batch_add, add);
+            EXPECT_EQ(batch_rescale, rescale);
+            EXPECT_EQ(batch_error, error);
+        }
+    }
+}

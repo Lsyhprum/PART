@@ -19,7 +19,7 @@ TEST_ROUNDS = 3
 
 def main(args=None) -> None:
     # 1. Load queries and ground truth
-    queries = read_fvecs(args.query_file)
+    queries = np.ascontiguousarray(read_fvecs(args.query_file))
     gt = read_ivecs(args.gt_file)
     nq = queries.shape[0]
     print(f"Queries: {queries.shape}, GT: {gt.shape}")
@@ -60,7 +60,7 @@ def main(args=None) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RaBitQ SymphonyQG Querying Manager")
+    parser = argparse.ArgumentParser(description="SymphonyQG Querying Manager")
     parser.add_argument(
         "index_file", type=str, help="Path to the SymphonyQG index file"
     )

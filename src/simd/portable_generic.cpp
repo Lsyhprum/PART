@@ -5,15 +5,15 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "rabitqlib/simd/pack_excode_dispatch.hpp"
-#include "rabitqlib/simd/rotator_dispatch.hpp"
-#include "rabitqlib/simd/space_dispatch.hpp"
-#include "rabitqlib/simd/warmup_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/pack_excode_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/rotator_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/space_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/warmup_dispatch.hpp"
 #include "rabitqlib/utils/bitops.hpp"
 
 namespace rabitqlib::simd {
 namespace {
-// Coordinate-to-bit mapping of the existing x86 packed format. Odd widths
+// Coordinate-to-bit mapping of the historical full-block layout. Odd widths
 // store the high bit in eight bytes, with coordinate i at byte i%8, bit i/8.
 template <size_t Bits>
 size_t packed_bit(size_t i, size_t bit) {
@@ -42,21 +42,83 @@ size_t packed_bit(size_t i, size_t bit) {
     }
 }
 
+// Read one code from the compact little-endian tail, without overreading its end.
+template <size_t Bits>
+unsigned tail_code(const uint8_t* compact, size_t i) {
+    const size_t offset = i * Bits;
+    unsigned code = compact[offset / 8] >> (offset % 8);
+    if (offset % 8 + Bits > 8) {
+        code |= unsigned{compact[offset / 8 + 1]} << (8 - offset % 8);
+    }
+    return code & ((1U << Bits) - 1);
+}
+
 template <size_t Bits>
 void pack(const uint8_t* raw, uint8_t* compact, size_t dim) {
-    std::fill_n(compact, dim * Bits / 8, uint8_t{0});
-    for (size_t i = 0; i < dim; ++i) {
-        for (size_t b = 0; b < Bits; ++b) {
+    const size_t full = (Bits == 1 || Bits == 4 || Bits == 8) ? dim : dim - dim % 64;
+    std::fill_n(compact, full * Bits / 8, uint8_t{0});
+    for (size_t i = 0; i < full; ++i) {
+        for (size_t b = 0; b < Bits; b += 2) {
             const size_t pos = packed_bit<Bits>(i, b);
-            compact[pos / 8] |= ((raw[i] >> b) & 1U) << (pos % 8);
+            const unsigned mask = b + 1 < Bits ? 3U : 1U;
+            compact[pos / 8] |= ((raw[i] >> b) & mask) << (pos % 8);
         }
+    }
+    // Every legal tail occupies whole bytes; at most one byte is emitted per code.
+    unsigned pending = 0, count = 0;
+    size_t output = full * Bits / 8;
+    for (size_t i = full; i < dim; ++i) {
+        pending |= (unsigned{raw[i]} & ((1U << Bits) - 1)) << count;
+        count += Bits;
+        if (count >= 8) {
+            compact[output++] = static_cast<uint8_t>(pending);
+            pending >>= 8;
+            count -= 8;
+        }
+    }
+}
+
+// Inverse of pack, over the same mapping. Not a search path, so scalar only.
+template <size_t Bits>
+void unpack(const uint8_t* compact, uint8_t* raw, size_t dim) {
+    if constexpr (Bits == 8) {
+        std::copy_n(compact, dim, raw);
+        return;
+    }
+    if constexpr (Bits == 4) {
+        // Each group of eight bytes holds two interleaved groups of eight nibbles.
+        for (size_t i = 0; i < dim; i += 16) {
+            for (size_t j = 0; j < 8; ++j) {
+                const uint8_t pair = compact[i / 2 + j];
+                raw[i + j] = pair & 0x0f;
+                raw[i + 8 + j] = pair >> 4;
+            }
+        }
+        return;
+    }
+    const size_t full = (Bits == 1 || Bits == 4 || Bits == 8) ? dim : dim - dim % 64;
+    for (size_t i = 0; i < full; ++i) {
+        unsigned code = 0;
+        // Every pair occupies adjacent bits, even in the split 6/7-bit layout.
+        // Odd widths leave the separate high bit for the final iteration.
+        for (size_t b = 0; b < Bits; b += 2) {
+            const size_t pos = packed_bit<Bits>(i, b);
+            unsigned pair = compact[pos / 8] >> (pos % 8);
+            const unsigned mask = b + 1 < Bits ? 3U : 1U;
+            code |= (pair & mask) << b;
+        }
+        raw[i] = static_cast<uint8_t>(code);
+    }
+    for (size_t i = full; i < dim; ++i) {
+        raw[i] = static_cast<uint8_t>(tail_code<Bits>(compact + full * Bits / 8, i - full));
     }
 }
 
 template <size_t Bits>
 float excode_ip(const float* query, const uint8_t* compact, size_t dim) {
     double sum = 0;
-    for (size_t i = 0; i < dim; ++i) {
+    const size_t full = (Bits == 1 || Bits == 4 || Bits == 8) ? dim : dim - dim % 64;
+    for (size_t i = 0; i < full; ++i) {
         unsigned code = 0;
         for (size_t b = 0; b < Bits; ++b) {
             const size_t pos = packed_bit<Bits>(i, b);
@@ -64,11 +126,19 @@ float excode_ip(const float* query, const uint8_t* compact, size_t dim) {
         }
         sum += static_cast<double>(query[i]) * code;
     }
+    for (size_t i = full; i < dim; ++i) {
+        sum += static_cast<double>(query[i]) *
+               tail_code<Bits>(compact + full * Bits / 8, i - full);
+    }
     return static_cast<float>(sum);
 }
 
 template <typename T>
 void quantize(T* result, const float* data, size_t dim, float lo, float delta) {
+    if (delta == 0.0F) {
+        std::fill_n(result, dim, T{0});
+        return;
+    }
     const float reciprocal = 1.0F / delta;
     for (size_t i = 0; i < dim; ++i) {
         result[i] = static_cast<T>(std::round((data[i] - lo) * reciprocal));
@@ -88,11 +158,11 @@ void fht(float* data, size_t dim) {
 }
 }  // namespace
 
-#define RABITQ_PACK(Bits)                                \
-    void packing_##Bits##bit_excode_generic(             \
-        const uint8_t* raw, uint8_t* compact, size_t dim \
-    ) {                                                  \
-        pack<Bits>(raw, compact, dim);                   \
+#define RABITQ_PACK(Bits)                                    \
+    void packing_##Bits##bit_excode_generic(                 \
+        const uint8_t* o_raw, uint8_t* o_compact, size_t dim \
+    ) {                                                      \
+        pack<Bits>(o_raw, o_compact, dim);                   \
     }
 RABITQ_PACK(2)
 RABITQ_PACK(3)
@@ -102,12 +172,45 @@ RABITQ_PACK(6)
 RABITQ_PACK(7)
 #undef RABITQ_PACK
 
+void unpacking_excode_generic(
+    const uint8_t* o_compact, uint8_t* o_raw, size_t dim, size_t bits
+) {
+    switch (bits) {
+        case 1:
+            unpack<1>(o_compact, o_raw, dim);
+            break;
+        case 2:
+            unpack<2>(o_compact, o_raw, dim);
+            break;
+        case 3:
+            unpack<3>(o_compact, o_raw, dim);
+            break;
+        case 4:
+            unpack<4>(o_compact, o_raw, dim);
+            break;
+        case 5:
+            unpack<5>(o_compact, o_raw, dim);
+            break;
+        case 6:
+            unpack<6>(o_compact, o_raw, dim);
+            break;
+        case 7:
+            unpack<7>(o_compact, o_raw, dim);
+            break;
+        case 8:
+            unpack<8>(o_compact, o_raw, dim);
+            break;
+        default:
+            throw std::invalid_argument("ex_bits must be in [1, 8]");
+    }
+}
+
 namespace excode_ipimpl {
-#define RABITQ_IP(Block, Bits)                              \
-    float ip##Block##_fxu##Bits##_generic(                  \
-        const float* query, const uint8_t* code, size_t dim \
-    ) {                                                     \
-        return excode_ip<Bits>(query, code, dim);           \
+#define RABITQ_IP(Block, Bits)                                      \
+    float ip##Block##_fxu##Bits##_generic(                          \
+        const float* query, const uint8_t* compact_code, size_t dim \
+    ) {                                                             \
+        return excode_ip<Bits>(query, compact_code, dim);           \
     }
 RABITQ_IP(16, 1)
 RABITQ_IP(64, 2)
@@ -132,50 +235,54 @@ void scalar_quantize_uint16_generic(
 }
 
 void new_transpose_bin_generic(
-    const uint16_t* query, uint64_t* transposed, size_t dim, size_t bits
+    const uint16_t* query, uint64_t* transposed_query, size_t padded_dim, size_t b_query
 ) {
-    for (size_t block = 0; block < dim; block += 64) {
-        for (size_t b = 0; b < bits; ++b) {
+    for (size_t block = 0; block < padded_dim; block += 64) {
+        const size_t width = std::min(size_t{64}, padded_dim - block);
+        for (size_t b = 0; b < b_query; ++b) {
             uint64_t word = 0;
-            for (size_t i = 0; i < 64; ++i) {
-                word |= uint64_t{(query[block + i] >> b) & 1U} << (63 - i);
+            for (size_t i = 0; i < width; ++i) {
+                word |= uint64_t{(query[block + i] >> b) & 1U} << (width - 1 - i);
             }
-            *transposed++ = word;
+            *transposed_query++ = word;
         }
     }
 }
 
 void new_transpose_bin_512_generic(
-    const uint8_t* query, uint64_t* transposed, size_t dim, size_t bits
+    const uint8_t* query, uint64_t* transposed_query, size_t padded_dim, size_t b_query
 ) {
-    for (size_t block = 0; block < dim; block += 512) {
-        const size_t chunks = std::min(size_t{512}, dim - block) / 64;
-        for (size_t b = 0; b < bits; ++b) {
+    for (size_t block = 0; block < padded_dim; block += 512) {
+        const size_t chunks = (std::min(size_t{512}, padded_dim - block) + 63) / 64;
+        for (size_t b = 0; b < b_query; ++b) {
             for (size_t chunk = 0; chunk < chunks; ++chunk) {
+                const size_t width = std::min(size_t{64}, padded_dim - block - chunk * 64);
                 uint64_t word = 0;
-                for (size_t i = 0; i < 64; ++i) {
-                    word |= uint64_t{(query[block + chunk * 64 + i] >> b) & 1U} << (63 - i);
+                for (size_t i = 0; i < width; ++i) {
+                    word |= uint64_t{(query[block + chunk * 64 + i] >> b) & 1U}
+                            << (width - 1 - i);
                 }
-                *transposed++ = word;
+                *transposed_query++ = word;
             }
         }
     }
 }
 
-float mask_ip_x0_q_generic(const float* query, const uint8_t* data, size_t dim) {
+float mask_ip_x0_q_generic(const float* query, const uint8_t* data, size_t padded_dim) {
     double sum = 0;
-    for (size_t block = 0; block < dim; block += 64) {
-        uint64_t word;
-        std::memcpy(&word, data + block / 8, sizeof(word));
-        for (size_t i = 0; i < 64; ++i) {
-            if ((word >> (63 - i)) & 1U)
+    for (size_t block = 0; block < padded_dim; block += 64) {
+        const size_t width = std::min(size_t{64}, padded_dim - block);
+        const uint64_t word = bitops::load_word(data + block / 8, width / 8);
+        for (size_t i = 0; i < width; ++i) {
+            if ((word >> (width - 1 - i)) & 1U) {
                 sum += query[block + i];
+            }
         }
     }
     return static_cast<float>(sum);
 }
-float mask_ip_x0_q_generic(const float* query, const uint64_t* data, size_t dim) {
-    return mask_ip_x0_q_generic(query, reinterpret_cast<const uint8_t*>(data), dim);
+float mask_ip_x0_q_generic(const float* query, const uint64_t* data, size_t padded_dim) {
+    return mask_ip_x0_q_generic(query, reinterpret_cast<const uint8_t*>(data), padded_dim);
 }
 
 float warmup_ip_x0_q_512_generic(
@@ -183,23 +290,25 @@ float warmup_ip_x0_q_512_generic(
     const uint64_t* query,
     float delta,
     float vl,
-    size_t dim,
-    size_t bits
+    size_t padded_dim,
+    size_t b_query
 ) {
-    if (bits > 8)
+    if (b_query > 8) {
         throw std::invalid_argument("warmup_ip_x0_q_512 requires at most 8 query bits");
+    }
     uint64_t ip = 0, count = 0;
-    for (size_t block = 0; block < dim; block += 512) {
-        const size_t chunks = std::min(size_t{512}, dim - block) / 64;
+    for (size_t block = 0; block < padded_dim; block += 512) {
+        const size_t chunks = (std::min(size_t{512}, padded_dim - block) + 63) / 64;
         for (size_t chunk = 0; chunk < chunks; ++chunk) {
-            uint64_t word;
-            std::memcpy(&word, data + block / 8 + chunk * 8, sizeof(word));
+            const size_t width = std::min(size_t{64}, padded_dim - block - chunk * 64);
+            const uint64_t word =
+                bitops::load_word(data + block / 8 + chunk * 8, width / 8);
             count += bitops::popcount64(word);
-            for (size_t b = 0; b < bits; ++b) {
+            for (size_t b = 0; b < b_query; ++b) {
                 ip += uint64_t{bitops::popcount64(word & query[b * chunks + chunk])} << b;
             }
         }
-        query += chunks * bits;
+        query += chunks * b_query;
     }
     return delta * static_cast<float>(ip) + vl * static_cast<float>(count);
 }
@@ -208,18 +317,19 @@ float warmup_ip_x0_q_512_generic(
     const uint64_t* query,
     float delta,
     float vl,
-    size_t dim,
-    size_t bits
+    size_t padded_dim,
+    size_t b_query
 ) {
     return warmup_ip_x0_q_512_generic(
-        reinterpret_cast<const uint8_t*>(data), query, delta, vl, dim, bits
+        reinterpret_cast<const uint8_t*>(data), query, delta, vl, padded_dim, b_query
     );
 }
 
 void flip_sign_generic(const uint8_t* flip, float* data, size_t dim) {
     for (size_t i = 0; i < dim; ++i) {
-        if ((flip[i / 8] >> (i % 8)) & 1U)
+        if ((flip[i / 8] >> (i % 8)) & 1U) {
             data[i] = -data[i];
+        }
     }
 }
 void kacs_walk_generic(float* data, size_t len) {
@@ -231,30 +341,33 @@ void kacs_walk_generic(float* data, size_t len) {
 }
 void fht_rotate_generic(
     const float* data,
-    float* output,
+    float* rotated_data,
     size_t dim,
-    size_t padded,
-    size_t trunc,
-    float factor,
+    size_t padded_dim,
+    size_t trunc_dim,
+    float scale_factor,
     const uint8_t* flip
 ) {
-    if (trunc < 64 || trunc > 65536 || (trunc & (trunc - 1)) != 0) {
+    if (trunc_dim < 64 || trunc_dim > 65536 || (trunc_dim & (trunc_dim - 1)) != 0) {
         throw std::invalid_argument("Unsupported dimension for FhtKacRotator");
     }
-    std::memmove(output, data, dim * sizeof(float));
-    std::fill(output + dim, output + padded, 0.0F);
+    std::memmove(rotated_data, data, dim * sizeof(float));
+    std::fill(rotated_data + dim, rotated_data + padded_dim, 0.0F);
     for (size_t pass = 0; pass < 4; ++pass) {
-        flip_sign_generic(flip + pass * padded / 8, output, padded);
-        const size_t start = pass % 2 == 0 ? 0 : padded - trunc;
-        fht(output + start, trunc);
-        for (size_t i = start; i < start + trunc; ++i)
-            output[i] *= factor;
-        if (padded != trunc)
-            kacs_walk_generic(output, padded);
+        flip_sign_generic(flip + pass * padded_dim / 8, rotated_data, padded_dim);
+        const size_t start = pass % 2 == 0 ? 0 : padded_dim - trunc_dim;
+        fht(rotated_data + start, trunc_dim);
+        for (size_t i = start; i < start + trunc_dim; ++i) {
+            rotated_data[i] *= scale_factor;
+        }
+        if (padded_dim != trunc_dim) {
+            kacs_walk_generic(rotated_data, padded_dim);
+        }
     }
-    if (padded != trunc) {
-        for (size_t i = 0; i < padded; ++i)
-            output[i] *= 0.25F;
+    if (padded_dim != trunc_dim) {
+        for (size_t i = 0; i < padded_dim; ++i) {
+            rotated_data[i] *= 0.25F;
+        }
     }
 }
 }  // namespace rabitqlib::simd

@@ -1,11 +1,24 @@
 #include <cstddef>
+#include <cstdint>
 
-#include "rabitqlib/simd/matrix_dispatch.hpp"
+#include "rabitqlib/core/detail/simd/matrix_dispatch.hpp"
 
 #define RABITQ_MATRIX_EIGEN_NAMESPACE rabitqlib_eigen_generic
 #include "matrix_kernels.hpp"
 
 namespace rabitqlib::simd {
+void accumulate_cluster_sums_generic(
+    const float* data,
+    const size_t* point_ids,
+    size_t count,
+    size_t dim,
+    const uint32_t* assignments,
+    double* sums,
+    size_t* counts
+) {
+    accumulate_cluster_sums_impl(data, point_ids, count, dim, assignments, sums, counts);
+}
+
 void matrix_product_generic(
     const float* left,
     const float* right,

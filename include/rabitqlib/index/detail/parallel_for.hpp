@@ -1,0 +1,129 @@
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <exception>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "rabitqlib/index/detail/parallel_exception.hpp"
+#include "rabitqlib/utils/openmp.hpp"
+#include "rabitqlib/utils/tools.hpp"
+
+namespace rabitqlib::index_detail {
+template <class Function>
+inline void parallel_for(
+    size_t start,
+    size_t end,
+    size_t num_threads,
+    Function fn
+) {
+    if (start >= end) {
+        return;
+    }
+    num_threads = std::min(resolve_num_threads(num_threads), end - start);
+
+    if (num_threads == 1) {
+        for (size_t id = start; id < end; ++id) {
+            fn(id, 0);
+        }
+    } else {
+#if RABITQ_USE_OPENMP && defined(_OPENMP) && _OPENMP >= 201307
+        if ((reuse_workers && omp_get_level() == 0) ||
+            omp_get_proc_bind() != omp_proc_bind_false) {
+            // Independent query batches can reuse workers; graph insertion keeps
+            // its existing scheduling. Binding requires OpenMP placement because
+            // native threads inherit only the caller's place. Keep unbound nested
+            // calls on the existing native-thread path.
+            ParallelException failure;
+#pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+            for (size_t id = start; id < end; ++id) {
+                if (failure.failed()) {
+                    continue;
+                }
+                try {
+                    fn(id, static_cast<size_t>(omp_get_thread_num()));
+                } catch (...) { failure.capture(); }
+            }
+            failure.rethrow();
+            return;
+        }
+#endif
+        std::vector<std::thread> threads;
+        std::atomic<size_t> current(start);
+
+        // keep track of exceptions in threads
+        // https://stackoverflow.com/a/32428427/1713196
+        std::exception_ptr last_exception = nullptr;
+        std::mutex last_except_mutex;
+
+        const auto join_threads = [&threads] {
+            for (auto& thread : threads) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        };
+
+        try {
+            threads.reserve(num_threads);
+            for (size_t thread_id = 0; thread_id < num_threads; ++thread_id) {
+                threads.emplace_back([&, thread_id] {
+                    while (true) {
+                        size_t id = current.fetch_add(1);
+
+                        if (id >= end) {
+                            break;
+                        }
+
+                        try {
+                            fn(id, thread_id);
+                        } catch (...) {
+                            std::unique_lock<std::mutex> last_except_lock(
+                                last_except_mutex
+                            );
+                            last_exception = std::current_exception();
+                            // This works even when current is the largest size_t value:
+                            // fetch_add returns the value before the increment, which
+                            // would otherwise overflow to 0 instead of current + 1.
+                            current = end;
+                            break;
+                        }
+                    }
+                });
+            }
+        } catch (...) {
+            current = end;
+            join_threads();
+            throw;
+        }
+        join_threads();
+        if (last_exception) {
+            std::rethrow_exception(last_exception);
+        }
+    }
+}
+
+#if RABITQ_USE_OPENMP
+// Runs fn(i, worker) for i in [0, count) on an OpenMP team with dynamic scheduling.
+// After an iteration throws, the remaining ones are skipped; the first exception is
+// rethrown once the team has joined.
+template <class Function>
+inline void omp_for_dynamic(size_t count, size_t num_workers, Function fn) {
+    ParallelException failure;
+#pragma omp parallel for num_threads(num_workers) schedule(dynamic)
+    for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(count); ++index) {
+        if (failure.failed()) {
+            continue;
+        }
+        try {
+            fn(static_cast<size_t>(index), static_cast<size_t>(omp_get_thread_num()));
+        } catch (...) { failure.capture(); }
+    }
+    failure.rethrow();
+}
+#endif
+
+}  // namespace rabitqlib::index_detail

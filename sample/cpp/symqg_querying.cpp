@@ -1,457 +1,391 @@
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
-#include <string>
-#include <cstdlib>
-#include <sstream>
-#include <vector>
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
 #include <limits>
-#include <fstream>
-#include <unordered_set>
-#include <utility>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-#include <getopt.h>
-#include <omp.h>
-
-#include "rabitqlib/defines.hpp"
+#include "rabitqlib/attribute/attr_filter.hpp"
+#include "rabitqlib/attribute/attr_io.hpp"
+#include "rabitqlib/attribute/attr_rerank.hpp"
+#include "rabitqlib/core/detail/eigen.hpp"
 #include "rabitqlib/index/symqg/qg.hpp"
-#include "rabitqlib/utils/attr_filter.hpp"
+#include "rabitqlib/index/types.hpp"
 #include "rabitqlib/utils/io.hpp"
 #include "rabitqlib/utils/stopw.hpp"
+#include "rabitqlib/utils/tools.hpp"
 
 using PID = rabitqlib::PID;
 using index_type = rabitqlib::symqg::QuantizedGraph<float>;
 using data_type = rabitqlib::RowMajorArray<float>;
 using gt_type = rabitqlib::RowMajorArray<uint32_t>;
+using rabitqlib::attribute::AttributeKind;
+using rabitqlib::attribute::AttributeMatrix;
+using rabitqlib::attribute::predicate_matches;
+using rabitqlib::attribute::query_stride;
+using rabitqlib::attribute::read_attr_bin;
 
-// 内置默认值：保持与 example.sh 原有用法（topk=10，内置 ef 列表）兼容。
-// run.sh 会通过位置参数覆盖这些默认值。
-std::vector<size_t> DEFAULT_EFS = {
-    10, 20, 40, 50, 60, 80, 100, 150, 170, 190,
-    200, 250, 300, 400, 500, 600, 700, 800, 1500};
-size_t DEFAULT_TOPK = 10;
-size_t DEFAULT_ROUNDS = 3;
-std::string DEFAULT_ALGO = "symqg";
-size_t DEFAULT_THREADS = 1;
+struct Args {
+    const char* index_file = nullptr;
+    const char* query_file = nullptr;
+    const char* gt_file = nullptr;
+    std::string base_attr_file;
+    std::string query_attr_file;
+    size_t attr_dim = 0;
+    std::string layout_text;
+    std::vector<AttributeKind> layout;
+    size_t qstride = 0;
+    bool filtered = false;
+    bool rerank = false;
+    std::string orig_base_file;
+    std::string orig_query_file;
+    size_t rerank_factor = 10;
+};
 
-// 解析逗号分隔的 ef 列表（如 "10,20,40"），跳过空项与非正值。
-std::vector<size_t> parse_efs(const std::string& s) {
-    std::vector<size_t> out;
-    if (s.empty()) return out;
-    std::stringstream ss(s);
-    std::string tok;
-    while (std::getline(ss, tok, ',')) {
-        tok.erase(0, tok.find_first_not_of(" \t"));
-        tok.erase(tok.find_last_not_of(" \t") + 1);
-        if (tok.empty()) continue;
-        size_t v = static_cast<size_t>(std::stoul(tok));
-        if (v > 0) out.push_back(v);
-    }
-    return out;
+void usage(const char* program) {
+    std::cerr << "Usage: " << program
+              << " <index> <query.fvecs> <gt.ivecs> [options]\n"
+              << "  --base-attr F       uint32 [N,A] base attribute file\n"
+              << "  --query-attr F      int32 [Nq,A] target attribute file\n"
+              << "  --attr-dim A        number of attribute dimensions\n"
+              << "  --layout T          comma-separated eq|range roles, one per A\n"
+              << "  --rerank            enable exact rerank with oversampling\n"
+              << "  --orig-base F       unrotated base fvecs (requires --rerank)\n"
+              << "  --orig-query F      unrotated query fvecs (requires --rerank)\n"
+              << "  --rerank-factor N   oversampling factor, default 10\n"
+              << "The three attribute options enable equality filtering together.\n"
+              << "With --layout range columns widen a query row to [lo,hi].\n";
 }
 
-// 原始空间 L2² 距离（重排用，与图内旋转空间距离解耦）。
-static inline float l2sq(const float* a, const float* b, size_t d) {
-    float s = 0.f;
-    for (size_t i = 0; i < d; ++i) {
-        float diff = a[i] - b[i];
-        s += diff * diff;
+size_t parse_size(const char* value, const std::string& option) {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0) {
+        throw std::invalid_argument("Invalid value for " + option);
     }
-    return s;
+    return static_cast<size_t>(parsed);
 }
 
-// ===================== 属性加载相关（行间过滤）=====================
-// 自适应加载属性 bin：文件支持两种格式
-//   1) 纯数据（无头）：filesize == expected_n * A * sizeof(T)
-//   2) 带头自描述：前 8 字节为两个 int32 [N, A]，filesize == 8 + 数据区
-// 已知 expected_n 与 A 时按文件大小自动判断；若有头则额外校验 N/A。
-// 谓词函数 attr_match / attr_match_range 由 rabitqlib/utils/attr_filter.hpp 提供。
-template <typename T>
-void load_attr_bin(const char* path, size_t expected_n, uint32_t A, std::vector<T>& out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        std::cerr << "[error] cannot open " << path << std::endl;
-        exit(-1);
+// An empty layout keeps the original all-equality path. Otherwise every token
+// declares one attribute column; range columns occupy [lo, hi] in the query
+// file, so the row width is derived by the shared query_stride helper.
+std::vector<AttributeKind> parse_layout(
+    const std::string& text, size_t attr_dim
+) {
+    if (text.empty()) {
+        return {};
     }
-    size_t data_bytes = (size_t)expected_n * A * sizeof(T);
-    in.seekg(0, std::ios::end);
-    std::ios::pos_type total = in.tellg();
-    in.seekg(0, std::ios::beg);
-
-    bool has_header = false;
-    if ((size_t)total == data_bytes) {
-        has_header = false;  // 纯数据格式
-    } else if ((size_t)total == sizeof(int32_t) * 2 + data_bytes) {
-        has_header = true;   // 8 字节 [N,A] 头
-        int32_t hdr[2];
-        in.read((char*)hdr, sizeof(int32_t) * 2);
-        if (hdr[0] != (int32_t)expected_n) {
-            std::cerr << "[error] attr N mismatch in " << path
-                      << ": header N=" << hdr[0] << " but expected " << expected_n << std::endl;
-            exit(-1);
+    std::vector<AttributeKind> layout;
+    size_t start = 0;
+    for (;;) {
+        const size_t comma = text.find(',', start);
+        const std::string token = text.substr(
+            start,
+            comma == std::string::npos ? std::string::npos : comma - start
+        );
+        if (token == "eq") {
+            layout.push_back(AttributeKind::kEquality);
+        } else if (token == "range") {
+            layout.push_back(AttributeKind::kRange);
+        } else {
+            throw std::invalid_argument("Unknown --layout token: " + token);
         }
-        if ((uint32_t)hdr[1] != A) {
-            std::cerr << "[error] attr A mismatch in " << path
-                      << ": header A=" << hdr[1] << " but expected " << A << std::endl;
-            exit(-1);
+        if (comma == std::string::npos) {
+            break;
         }
-    } else {
-        std::cerr << "[error] size mismatch " << path << ": expect "
-                  << data_bytes << " or "
-                  << (sizeof(int32_t) * 2 + data_bytes)
-                  << " bytes, got " << (size_t)total << std::endl;
-        exit(-1);
+        start = comma + 1;
     }
-    (void)has_header;  // 纯数据/带头均按相同方式读取数据区
-    out.resize((size_t)expected_n * A);
-    in.read((char*)out.data(), (std::streamsize)data_bytes);
-    in.close();
+    if (layout.size() != attr_dim) {
+        throw std::invalid_argument(
+            "--layout token count must equal --attr-dim"
+        );
+    }
+    return layout;
 }
+
+Args parse_args(int argc, char** argv) {
+    Args args;
+    args.index_file = argv[1];
+    args.query_file = argv[2];
+    args.gt_file = argv[3];
+    bool factor_given = false;
+    for (int i = 4; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--rerank") {
+            args.rerank = true;
+            continue;
+        }
+        if (i + 1 >= argc) {
+            throw std::invalid_argument("Missing value for " + option);
+        }
+        const char* value = argv[++i];
+        if (option == "--base-attr") {
+            args.base_attr_file = value;
+        } else if (option == "--query-attr") {
+            args.query_attr_file = value;
+        } else if (option == "--attr-dim") {
+            args.attr_dim = parse_size(value, option);
+        } else if (option == "--layout") {
+            args.layout_text = value;
+        } else if (option == "--orig-base") {
+            args.orig_base_file = value;
+        } else if (option == "--orig-query") {
+            args.orig_query_file = value;
+        } else if (option == "--rerank-factor") {
+            args.rerank_factor = parse_size(value, option);
+            factor_given = true;
+        } else {
+            throw std::invalid_argument("Unknown option: " + option);
+        }
+    }
+    const bool any_attr = !args.base_attr_file.empty() ||
+                          !args.query_attr_file.empty() || args.attr_dim != 0;
+    if (any_attr && (args.base_attr_file.empty() || args.query_attr_file.empty() ||
+                     args.attr_dim == 0)) {
+        throw std::invalid_argument(
+            "--base-attr, --query-attr and --attr-dim must be given together"
+        );
+    }
+    args.filtered = any_attr;
+    if (!args.layout_text.empty() && !args.filtered) {
+        throw std::invalid_argument(
+            "--layout requires --base-attr, --query-attr and --attr-dim"
+        );
+    }
+    if (args.filtered) {
+        args.layout = parse_layout(args.layout_text, args.attr_dim);
+        args.qstride = query_stride(
+            args.layout.empty() ? nullptr : args.layout.data(), args.attr_dim
+        );
+    }
+
+    if (args.rerank &&
+        (args.orig_base_file.empty() || args.orig_query_file.empty())) {
+        throw std::invalid_argument(
+            "--rerank requires both --orig-base and --orig-query"
+        );
+    }
+    const bool any_orig = !args.orig_base_file.empty() ||
+                          !args.orig_query_file.empty() || factor_given;
+    if (!args.rerank && any_orig) {
+        throw std::invalid_argument(
+            "--orig-base, --orig-query and --rerank-factor require --rerank"
+        );
+    }
+    return args;
+}
+
+std::vector<size_t> efs = {
+    10,
+    20,
+    40,
+    50,
+    60,
+    80,
+    100,
+    150,
+    170,
+    190,
+    200,
+    250,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    1500};
+size_t test_round = 3;
+size_t topk = 10;
 
 int run(int argc, char** argv) {
-    // ---- 参数解析：位置参数 index / query / gt 在前，其余为可选 flag ----
-    char* index_file = nullptr;
-    char* query_file = nullptr;
-    char* gt_file = nullptr;
-    size_t topk = DEFAULT_TOPK;
-    std::string efs_csv;
-    std::string algo = DEFAULT_ALGO;
-    size_t rounds = DEFAULT_ROUNDS;
-    size_t threads = DEFAULT_THREADS;
-
-    // 行间过滤（inline filter）相关参数
-    char base_attr_path[1024] = "";
-    char query_attr_path[1024] = "";
-    uint32_t attr_dim = 0;      // 属性维数 A（由 -A 传入；行间过滤必填）
-    bool range_mode = false;    // 范围模式开关（-r 启用）
-
-    // 增强臂（参考 RaBitQ-range-inline-rot 的新过滤算法）参数
-    //   --range_m M            : 每条逻辑查询的子中心旋转查询数（M>=1；=1 退化为单次）
-    //   --orig_base / --orig_query : 非旋转原始向量，供重排 L2² 计算（图内存储的是旋转向量）
-    char orig_base_path[2048] = "";
-    char orig_query_path[2048] = "";
-    uint32_t range_m = 0;
-
-    static struct option longopts[] = {
-        {"base_attr",  required_argument, 0, 'b'},
-        {"query_attr", required_argument, 0, 'a'},
-        {"attr_dim",   required_argument, 0, 'A'},
-        {"range",      no_argument,       0, 'r'},
-        {"range_m",    required_argument, 0, 'M'},
-        {"orig_base",  required_argument, 0, 1001},
-        {"orig_query", required_argument, 0, 1002},
-        {0, 0, 0, 0}
-    };
-    int iarg = 0, ind = 0;
-    opterr = 1;
-    while ((iarg = getopt_long(argc, argv, "b:a:A:rM:", longopts, &ind)) != -1) {
-        switch (iarg) {
-            case 'b':
-                if (optarg) std::strncpy(base_attr_path, optarg, sizeof(base_attr_path) - 1);
-                break;
-            case 'a':
-                if (optarg) std::strncpy(query_attr_path, optarg, sizeof(query_attr_path) - 1);
-                break;
-            case 'A':
-                if (optarg) attr_dim = (uint32_t)std::atoi(optarg);
-                break;
-            case 'r':
-                range_mode = true;
-                break;
-            case 'M':
-                if (optarg) range_m = (uint32_t)std::atoi(optarg);
-                break;
-            case 1001:
-                if (optarg) std::strncpy(orig_base_path, optarg, sizeof(orig_base_path) - 1);
-                break;
-            case 1002:
-                if (optarg) std::strncpy(orig_query_path, optarg, sizeof(orig_query_path) - 1);
-                break;
-            default:
-                break;
-        }
-    }
-    // 剩余的位置参数：index query gt [topk] [efs_csv] [algo] [rounds] [threads]
-    int pos = optind;
-    if (argc - pos < 3) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <index> <query.fvecs> <gt.ivecs>"
-                  << " [topk] [efs_csv] [algo] [rounds] [threads]"
-                  << " [-b base_attr.bin] [-a query_attr.bin] [-A attr_dim] [-r]"
-                  << " [--range_m M] [--orig_base base.fvecs] [--orig_query query.fvecs]\n";
+    if (argc < 4) {
+        usage(argv[0]);
         return 1;
     }
-    index_file = argv[pos];
-    query_file = argv[pos + 1];
-    gt_file = argv[pos + 2];
-    if (argc - pos > 3 && argv[pos + 3][0] != '\0')
-        topk = static_cast<size_t>(std::stoul(argv[pos + 3]));
-    if (argc - pos > 4 && argv[pos + 4][0] != '\0')
-        efs_csv = argv[pos + 4];
-    if (argc - pos > 5 && argv[pos + 5][0] != '\0')
-        algo = argv[pos + 5];
-    if (argc - pos > 6 && argv[pos + 6][0] != '\0')
-        rounds = static_cast<size_t>(std::stoul(argv[pos + 6]));
-    if (argc - pos > 7 && argv[pos + 7][0] != '\0')
-        threads = static_cast<size_t>(std::stoul(argv[pos + 7]));
-
-    std::vector<size_t> efs = efs_csv.empty() ? DEFAULT_EFS : parse_efs(efs_csv);
-    if (efs.empty()) efs = DEFAULT_EFS;
-
-    // 增强臂判定：range_m>0 且提供原始 base/query 即启用「旋转+M 子中心+重排闸门」
-    const bool enhanced =
-        (range_m > 0) &&
-        (orig_base_path[0] != '\0') && (orig_query_path[0] != '\0');
-    if (enhanced) {
-        std::cerr << "[enhanced] 启用范围旋转增强算法: range_m=" << range_m << std::endl;
-        range_mode = true;   // 增强臂的 -a 是范围 bin（2*A 列），统一按 range 解析
-    }
+    const Args args = parse_args(argc, argv);
 
     data_type query;
     gt_type gt;
-    rabitqlib::load_vecs<float, data_type>(query_file, query);
-    rabitqlib::load_vecs<uint32_t, gt_type>(gt_file, gt);
-    const size_t nq_rows = query.rows();
-    // 增强臂下主查询文件是 Nq*M 行旋转 query；逻辑查询数 = 行数 / range_m。
-    const size_t nq_eff = enhanced ? (nq_rows / range_m) : nq_rows;
-    const size_t total_count = nq_eff * topk;
+    rabitqlib::load_vecs<float, data_type>(args.query_file, query);
+    rabitqlib::load_vecs<uint32_t, gt_type>(args.gt_file, gt);
+    const size_t nq = query.rows();
+    const size_t total_count = nq * topk;
 
     index_type qg;
-    qg.load(index_file);
+    qg.load(args.index_file);
 
-    // ---- 加载属性（行间过滤 / 增强臂开启时）----
-    const bool use_attr =
-        (base_attr_path[0] != '\0') || (query_attr_path[0] != '\0');
-    std::vector<uint32_t> base_attr;   // [N][A]
-    std::vector<int32_t> query_attr;   // [Nq_logical][A]（等值）或 [Nq_logical][2A]（范围）
-    uint32_t A = 0;
-    if (use_attr) {
-        if (base_attr_path[0] == '\0' || query_attr_path[0] == '\0') {
-            std::cerr << "[error] base_attr (-b) and query_attr (-a) must be provided together\n";
-            return -1;
+    data_type orig_base;
+    data_type orig_query;
+    if (args.rerank) {
+        if (qg.metric_type() != rabitqlib::METRIC_L2) {
+            throw std::invalid_argument(
+                "--rerank uses original-space L2 and requires an L2 index"
+            );
         }
-        if (attr_dim == 0) {
-            std::cerr << "[error] attr_dim (-A) must be provided for inline filter\n";
-            return -1;
+        rabitqlib::load_vecs<float, data_type>(
+            args.orig_base_file.c_str(), orig_base
+        );
+        rabitqlib::load_vecs<float, data_type>(
+            args.orig_query_file.c_str(), orig_query
+        );
+        if (orig_base.cols() != query.cols() ||
+            orig_query.cols() != query.cols()) {
+            throw std::runtime_error(
+                "Original vector dimension does not match the query vectors"
+            );
         }
-        A = attr_dim;
-        uint32_t query_cols = range_mode ? 2 * A : A;
-        // 增强臂下主查询文件是 Nq*M 行，但 range bin 仅有 Nq_logical 行 -> 用 nq_eff 校验
-        load_attr_bin(base_attr_path, qg.num_vertices(), A, base_attr);
-        load_attr_bin(query_attr_path, nq_eff, query_cols, query_attr);
-        std::cerr << "Loaded attributes: A = " << A
-                  << ", base rows = " << qg.num_vertices() << ", logical query rows = " << nq_eff
-                  << (range_mode ? " [range mode: query cols = 2*A]" : "") << std::endl;
+        if (static_cast<size_t>(orig_query.rows()) != nq ||
+            static_cast<size_t>(orig_base.rows()) < qg.num_points()) {
+            throw std::runtime_error(
+                "Original vector row count does not match the dataset"
+            );
+        }
     }
 
-    // ---- 原始（非旋转）base/query 供重排 L2²（增强臂与 inline 精确重排复用；
-    //      旋转保距，故旋转空间距离==原始空间距离，与 GT 口径一致）----
-    data_type orig_base, orig_query;
-    size_t D = query.cols();
-    const bool have_orig =
-        (orig_base_path[0] != '\0') && (orig_query_path[0] != '\0');
-    if (have_orig) {
-        rabitqlib::load_vecs<float, data_type>(orig_base_path, orig_base);
-        rabitqlib::load_vecs<float, data_type>(orig_query_path, orig_query);
-        D = orig_base.cols();
-        std::cerr << "Loaded orig vectors for rerank: base=" << orig_base.rows()
-                  << " query=" << orig_query.rows() << " dim=" << D << std::endl;
-        if (orig_base.rows() != qg.num_vertices()) {
-            std::cerr << "[error] orig_base rows (" << orig_base.rows()
-                      << ") != graph vertices (" << qg.num_vertices() << ")\n";
-            return -1;
+    size_t search_k = topk;
+    if (args.rerank) {
+        if (args.rerank_factor > std::numeric_limits<size_t>::max() / topk) {
+            throw std::length_error("--rerank-factor is too large");
         }
-        if (orig_query.rows() != nq_eff) {
-            std::cerr << "[error] orig_query rows (" << orig_query.rows()
-                      << ") != logical queries (" << nq_eff << ")\n";
-            return -1;
+        const size_t scaled = topk * args.rerank_factor;
+        search_k = std::min(scaled, qg.num_points());
+        if (search_k == 0 ||
+            search_k > std::numeric_limits<uint32_t>::max()) {
+            throw std::length_error("Invalid oversampled candidate count");
         }
     }
+
+    AttributeMatrix<uint32_t> base_attrs;
+    AttributeMatrix<int32_t> query_attrs;
+    if (args.filtered) {
+        base_attrs = read_attr_bin<uint32_t>(args.base_attr_file.c_str());
+        query_attrs = read_attr_bin<int32_t>(args.query_attr_file.c_str());
+        if (base_attrs.cols != args.attr_dim ||
+            query_attrs.cols != args.qstride) {
+            throw std::runtime_error(
+                "Attribute column count does not match --attr-dim"
+            );
+        }
+        if (base_attrs.rows < qg.num_points() || query_attrs.rows < nq) {
+            throw std::runtime_error(
+                "Attribute row count is smaller than the indexed dataset"
+            );
+        }
+    }
+    size_t predicate_violations = 0;
 
     rabitqlib::StopW stopw;
 
-    std::vector<std::vector<float>> all_qps(rounds,
-                                            std::vector<float>(efs.size()));
-    std::vector<std::vector<float>> all_recall(rounds,
-                                               std::vector<float>(efs.size()));
-    // 行间过滤模式下额外统计：谓词违反数（校验内核正确性）与完全满足查询数
-    std::vector<std::vector<uint32_t>> all_viol(rounds,
-                                                std::vector<uint32_t>(efs.size()));
-    std::vector<std::vector<uint32_t>> all_sat(rounds,
-                                               std::vector<uint32_t>(efs.size()));
+    std::vector<std::vector<float>> all_qps(test_round, std::vector<float>(efs.size()));
+    std::vector<std::vector<float>> all_recall(test_round, std::vector<float>(efs.size()));
 
-    for (size_t r = 0; r < rounds; r++) {
+    for (size_t r = 0; r < test_round; r++) {
         for (size_t i = 0; i < efs.size(); ++i) {
-            size_t ef = efs[i];
-            // 行间过滤 / 增强臂：ef 作为图的探索预算，无需过采样；knn 直接取 K。
-            // Symqg 要求 search_ef >= knn，故 search_ef = max(ef, K)。
-            const size_t search_ef = ef < topk ? topk : ef;
-            // 增强臂：每个子中心需收集多于 K 的候选（旋转空间近邻未必等于原始 L2 近邻，
-            // 须扩大候选池再按原始空间 L2² 重排，否则 top-K 召回受限）。图的 ef 须 >= knn。
-            const size_t cand_knn = enhanced
-                ? std::min((size_t)qg.num_vertices(),
-                           std::max((size_t)topk * 10, search_ef))
-                : (size_t)topk;
-            const size_t ef_for_search = enhanced
-                ? std::max(search_ef, cand_knn)
-                : search_ef;
-
+            const size_t ef = efs[i];
             size_t total_correct = 0;
-            uint32_t total_viol = 0;
-            uint32_t n_sat = 0;
-            qg.set_ef(ef_for_search);
+            float total_time = 0;
+            qg.set_ef(std::max(ef, search_k));
+            std::vector<PID> results(total_count);
+            std::vector<float> dists(total_count);
+            std::vector<PID> candidates;
+            std::vector<float> candidate_dists;
+            if (args.rerank) {
+                candidates.resize(nq * search_k);
+                candidate_dists.resize(nq * search_k);
+            }
+            PID* search_ids = args.rerank ? candidates.data() : results.data();
+            float* search_dists =
+                args.rerank ? candidate_dists.data() : dists.data();
+            const auto search_k_u32 = static_cast<uint32_t>(search_k);
             stopw.reset();
-            const int nt =
-                threads == 0 ? omp_get_max_threads()
-                            : static_cast<int>(threads);
-#pragma omp parallel for num_threads(nt) schedule(dynamic) if (nt > 1) reduction(+:total_correct, total_viol, n_sat)
-            for (std::ptrdiff_t z = 0;
-                 z < static_cast<std::ptrdiff_t>(nq_eff); ++z) {
-                // results/dists 必须线程私有，避免多线程写同一缓冲造成数据竞争。
-                std::vector<PID> results(topk);
-                std::vector<float> dists(topk);
-                const int32_t* qa = nullptr;
-
-                if (enhanced) {
-                    // ---- 增强臂：M 条旋转子查询并集候选（候选池放大以覆盖原始 L2 近邻）----
-                    std::unordered_set<uint32_t> cand;
-                    std::vector<PID> tmp_r(cand_knn);
-                    std::vector<float> tmp_d(cand_knn);
-                    for (uint32_t s = 0; s < range_m; ++s) {
-                        qg.search(&query(static_cast<Eigen::Index>(
-                                         z * (std::ptrdiff_t)range_m + s), 0),
-                                  (uint32_t)cand_knn, tmp_r.data(), tmp_d.data());
-                        for (size_t y = 0; y < cand_knn; ++y)
-                            if (tmp_r[y] != std::numeric_limits<uint32_t>::max())
-                                cand.insert(tmp_r[y]);
-                    }
-                    // ---- 原始空间 L2² 重排 + 精确 range 闸门（Soundness 兜底）----
-                    const int32_t* qr = &query_attr[(std::ptrdiff_t)z * (std::ptrdiff_t)(2 * A)];
-                    std::vector<std::pair<float, uint32_t>> re;
-                    re.reserve(cand.size());
-                    for (uint32_t id : cand) {
-                        if (!rabitqlib::utils::attr_match_range(
-                                &base_attr[(std::ptrdiff_t)id * A], qr, A))
-                            continue;   // 硬闸门：不通过丢弃（Soundness 保证）
-                        float d2 = l2sq(&orig_base(static_cast<Eigen::Index>(id), 0),
-                                        &orig_query(static_cast<Eigen::Index>(z), 0), D);
-                        re.emplace_back(d2, id);
-                    }
-                    std::sort(re.begin(), re.end());
-                    size_t take = std::min((size_t)topk, re.size());
-                    for (size_t y = 0; y < take; ++y) {
-                        results[y] = re[y].second;
-                        dists[y] = re[y].first;
-                    }
-                    for (size_t y = take; y < topk; ++y) {
-                        results[y] = std::numeric_limits<uint32_t>::max();
-                        dists[y] = std::numeric_limits<float>::max();
-                    }
-                } else if (use_attr) {
-                    // ---- 现有行间过滤（等值 / -r 范围硬闸门）----
-                    qa = query_attr.data() +
-                         (std::ptrdiff_t)z * (range_mode ? (std::ptrdiff_t)(2 * A)
-                                                        : (std::ptrdiff_t)A);
-                    // 属性谓词在内核中即时判定，结果堆只含匹配项。
-                    qg.search(&query(static_cast<Eigen::Index>(z), 0),
-                              (uint32_t)topk, results.data(), dists.data(),
-                              base_attr.data(), qa, A, range_mode);
-                    // 精确重排（对齐 IVF 阶段2）：仅对内核已筛选出的匹配候选，
-                    // 按原始空间 L2² 重排，修正 bit>0 量化距离噪声导致的错误排序。
-                    // 非匹配节点不进入候选，故不会计算其原始距离（满足 2.1）。
-                    if (have_orig) {
-                        std::vector<std::pair<float, uint32_t>> re;
-                        re.reserve(topk);
-                        for (size_t y = 0; y < topk; ++y) {
-                            PID pid = results[y];
-                            if (pid == std::numeric_limits<uint32_t>::max()) continue;
-                            float d2 = l2sq(&orig_base(static_cast<Eigen::Index>(pid), 0),
-                                            &orig_query(static_cast<Eigen::Index>(z), 0), D);
-                            re.emplace_back(d2, pid);
-                        }
-                        std::sort(re.begin(), re.end());
-                        for (size_t y = 0; y < topk; ++y) {
-                            if (y < re.size()) {
-                                results[y] = re[y].second;
-                                dists[y] = re[y].first;
-                            } else {
-                                results[y] = std::numeric_limits<uint32_t>::max();
-                                dists[y] = std::numeric_limits<float>::max();
-                            }
-                        }
-                    }
+            if (args.filtered) {
+                if (args.layout.empty()) {
+                    qg.search_batch(
+                        query.data(), nq, search_k_u32, search_ids, search_dists,
+                        base_attrs.data(), query_attrs.data(), args.attr_dim
+                    );
                 } else {
-                    // ---- 纯向量检索 ----
-                    qg.search(&query(static_cast<Eigen::Index>(z), 0),
-                              (uint32_t)topk, results.data(), dists.data());
+                    qg.search_batch(
+                        query.data(), nq, search_k_u32, search_ids, search_dists,
+                        base_attrs.data(), query_attrs.data(), args.attr_dim,
+                        args.layout.data()
+                    );
                 }
-
-                size_t correct = 0;
-                uint32_t viol = 0;
+            } else {
+                qg.search_batch(
+                    query.data(), nq, search_k_u32, search_ids, search_dists
+                );
+            }
+            if (args.rerank) {
+                for (size_t z = 0; z < nq; ++z) {
+                    rabitqlib::attribute::rerank_by_original_l2(
+                        candidates.data() + z * search_k,
+                        search_k,
+                        orig_base.data(),
+                        static_cast<size_t>(orig_base.rows()),
+                        static_cast<size_t>(query.cols()),
+                        orig_query.data() + z * static_cast<size_t>(query.cols()),
+                        results.data() + z * topk,
+                        dists.data() + z * topk,
+                        topk,
+                        rabitqlib::kPidMax
+                    );
+                }
+            }
+            total_time = stopw.get_elapsed_micro();
+            for (size_t z = 0; z < nq; z++) {
                 for (size_t y = 0; y < topk; y++) {
-                    PID pid = results[y];
-                    if (pid == std::numeric_limits<uint32_t>::max()) continue;  // 哨兵（匹配不足 K）
-                    // 增强臂结果已通过精确闸门，无需重复校验（viol 恒为 0）
-                    if (!enhanced && use_attr && qa != nullptr) {
-                        const uint32_t* ba = &base_attr[(std::ptrdiff_t)pid * A];
-                        bool ok = range_mode
-                            ? rabitqlib::utils::attr_match_range(ba, qa, A)
-                            : rabitqlib::utils::attr_match(ba, qa, A);
-                        if (!ok) viol++;
+                    const PID id = results[z * topk + y];
+                    if (id == rabitqlib::kPidMax) {
+                        continue;
+                    }
+                    if (args.filtered) {
+                        const size_t offset = static_cast<size_t>(id) * args.attr_dim;
+                        if (!predicate_matches(
+                                base_attrs.data() + offset,
+                                query_attrs.data() + z * args.qstride,
+                                args.attr_dim,
+                                args.layout.empty() ? nullptr
+                                                    : args.layout.data())) {
+                            ++predicate_violations;
+                        }
                     }
                     for (size_t k = 0; k < topk; k++) {
                         if (gt(static_cast<Eigen::Index>(z),
-                               static_cast<Eigen::Index>(k)) == pid) {
-                            correct++;
+                               static_cast<Eigen::Index>(k)) == id) {
+                            total_correct++;
                             break;
                         }
                     }
                 }
-                total_correct += correct;
-                total_viol += viol;
-                if (viol == 0) n_sat++;
             }
-            double elapsed_sec = stopw.get_elapsed_micro() / 1e6;
-            float qps = elapsed_sec > 0
-                            ? static_cast<float>(nq_eff) /
-                                  static_cast<float>(elapsed_sec)
-                            : 0.0F;
-            float recall = static_cast<float>(total_correct) /
-                           static_cast<float>(total_count);
+            float qps = static_cast<float>(nq) / (total_time / 1e6F);
+            float recall =
+                static_cast<float>(total_correct) / static_cast<float>(total_count);
 
             all_qps[r][i] = qps;
             all_recall[r][i] = recall;
-            all_viol[r][i] = total_viol;
-            all_sat[r][i] = n_sat;
         }
     }
 
     auto avg_qps = rabitqlib::horizontal_avg(all_qps);
     auto avg_recall = rabitqlib::horizontal_avg(all_recall);
-    auto avg_sat = rabitqlib::horizontal_avg(all_sat);
-    auto avg_viol = rabitqlib::horizontal_avg(all_viol);
 
     std::cout << "EF\tQPS\tRecall\n";
     for (size_t i = 0; i < avg_qps.size(); ++i) {
-        std::cout << efs[i] << '\t' << avg_qps[i] << '\t' << avg_recall[i]
-                  << '\n';
+        std::cout << efs[i] << '\t' << avg_qps[i] << '\t' << avg_recall[i] << '\n';
     }
-
-    // ---- eval_tradeoff.py 兼容行 ----
-    // 格式：[RESULT] algo=<alg> param=<ef> k=<K> qps=<q> recall=<r>
-    for (size_t i = 0; i < avg_qps.size(); ++i) {
-        std::cout << "[RESULT] algo=" << algo
-                  << " param=" << efs[i]
-                  << " k=" << topk
-                  << " qps=" << avg_qps[i]
-                  << " recall=" << avg_recall[i] << '\n';
-        if (use_attr || enhanced) {
-            std::cout << "Filtered results all satisfy attr: "
-                      << (uint32_t)avg_sat[i] << " / " << nq_eff << '\n';
-            std::cout << "Predicate violations: " << (uint32_t)avg_viol[i] << '\n';
-        }
+    if (args.filtered) {
+        std::cout << "Predicate violations: " << predicate_violations << '\n';
+    }
+    if (args.rerank) {
+        std::cout << "Rerank: factor=" << args.rerank_factor
+                  << ", candidates=" << search_k << '\n';
     }
 
     return 0;
