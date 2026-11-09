@@ -1,4 +1,4 @@
-# PART
+# PART: Baking Attributes into High-Dimensional Vectors for Filtered Approximate Nearest Neighbor Search
 
 **Attribute-aware vector search with phase rotation (APR / HAPR).**
 
