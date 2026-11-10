@@ -604,5 +604,5 @@ oversampling and predicate statistics here follow PART's QG protocol instead.
    `WildcardPolicy::kMultiProbe` value, and optionally M>1 range sub-centres.
 2. Make oversampling attribute-aware at routing time, for example by raising
    `nprobe` together with `k` when predicate selectivity is low.
-3. Wire the `--layout` protocol into the Python bindings and benchmarks so
+3. Wire the `--layout` protocol into the Python bindings so
    range / mixed predicates can be evaluated outside the C++ CLIs.

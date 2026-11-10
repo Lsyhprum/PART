@@ -14,7 +14,6 @@ option(RABITQ_BUILD_FASTSCAN "Build batch scoring and FastScan SIMD kernels" ON)
 option(RABITQ_BUILD_INDEX "Build ANN indexes and clustering" ON)
 option(RABITQ_BUILD_SAMPLES "Build C++ sample programs" ON)
 option(RABITQ_BUILD_TESTS "Build C++ tests" OFF)
-option(RABITQ_BUILD_BENCHMARKS "Build component quantization and hot-path benchmarks" OFF)
 option(RABITQ_BUILD_PYTHON_BINDINGS "Build Python bindings" OFF)
 option(RABITQ_USE_OPENMP "Use OpenMP for parallel helpers (required by ANN indexes)" ON)
 option(RABITQ_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -338,17 +337,12 @@ install(FILES
     DESTINATION "${rabitqlib_cmake_dir}"
 )
 
-if(RABITQ_BUILD_TESTS OR RABITQ_BUILD_BENCHMARKS)
+if(RABITQ_BUILD_TESTS)
     enable_testing()
 endif()
 
 if(RABITQ_BUILD_SAMPLES)
     add_subdirectory(sample/cpp)
-endif()
-
-if(RABITQ_BUILD_BENCHMARKS)
-    add_subdirectory(benchmarks/core)
-    add_subdirectory(benchmarks/hotpaths)
 endif()
 
 if(RABITQ_BUILD_PYTHON_BINDINGS)

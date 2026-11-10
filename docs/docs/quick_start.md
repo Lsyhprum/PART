@@ -99,7 +99,7 @@ Probing more clusters searches more candidates, but even probing all five does
 not guarantee recall of 1: quantized scoring and filtering remain approximate.
 
 This small example demonstrates the calculation. For tuning, use representative
-held-out queries and compare recall with latency; see the [benchmark guide](benchmarks/bench.md).
+held-out queries and compare recall with latency; see the benchmark guide.
 The exhaustive array above is only suitable for small datasets. IP ground truth
 must rank `1 - dot` instead of squared L2.
 

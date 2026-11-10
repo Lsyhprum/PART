@@ -92,7 +92,7 @@ The CLI tools are produced under `build/bin/` (or `bin/` for an in-tree build):
 SymphonyQG / HNSW equivalents.
 
 Key CMake options: `RABITQ_BUILD_INDEX`, `RABITQ_BUILD_FASTSCAN`,
-`RABITQ_BUILD_SAMPLES`, `RABITQ_BUILD_TESTS`, `RABITQ_BUILD_BENCHMARKS`,
+`RABITQ_BUILD_SAMPLES`, `RABITQ_BUILD_TESTS`,
 `RABITQ_BUILD_PYTHON_BINDINGS`, and `RABITQ_USE_OPENMP` (required by the ANN
 indexes). `src/attribute/apr_rotation.cpp` is compiled with
 `-ffp-contract=off -fno-fast-math` so its float32 output matches the NumPy

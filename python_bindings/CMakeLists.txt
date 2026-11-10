@@ -69,16 +69,3 @@ endif()
 # inside the target wheel, completely bypassing your local layout.
 install(TARGETS _rabitqlib DESTINATION rabitqlib)
 install(FILES __init__.py __init__.pyi py.typed quant.py quant.pyi DESTINATION rabitqlib)
-
-if(RABITQ_BUILD_BENCHMARKS)
-    # Benchmark the production conversion helper without importing or replacing
-    # the installed package. This module is never installed in the wheel.
-    pybind11_add_module(rabitq_ids_benchmark NO_EXTRAS ../benchmarks/hotpaths/ids.cpp)
-    target_include_directories(rabitq_ids_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(rabitq_ids_benchmark PRIVATE rabitqlib::index)
-    rabitq_configure_target(rabitq_ids_benchmark)
-    set_target_properties(rabitq_ids_benchmark PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
-    add_test(NAME PythonIdsHotpath COMMAND "${Python_EXECUTABLE}"
-        "${PROJECT_SOURCE_DIR}/benchmarks/hotpaths/ids.py"
-        --module-dir "$<TARGET_FILE_DIR:rabitq_ids_benchmark>" --rows 32 --iterations 2 --repetitions 1)
-endif()

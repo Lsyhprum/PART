@@ -132,8 +132,8 @@ To apply Python formatting and safe automatic lint fixes before running the
 check:
 
 ```bash
-ruff check --fix python_bindings sample/python tests/python tests/test_mypy.py tests/test_pyright.py benchmarks
-ruff format python_bindings sample/python tests/python tests/test_mypy.py tests/test_pyright.py benchmarks
+ruff check --fix python_bindings sample/python tests/python tests/test_mypy.py tests/test_pyright.py
+ruff format python_bindings sample/python tests/python tests/test_mypy.py tests/test_pyright.py
 ```
 
 `check-python.sh` does not cover the CI automation in `.github/scripts`; CI also
@@ -252,7 +252,6 @@ cmake -S . -B build-includes -G Ninja \
   -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
   -DRABITQ_BUILD_SAMPLES=ON \
   -DRABITQ_BUILD_TESTS=ON \
-  -DRABITQ_BUILD_BENCHMARKS=ON \
   -DRABITQ_BUILD_PYTHON_BINDINGS=ON \
   -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF \
   -DCMAKE_BUILD_TYPE=Release
@@ -260,7 +259,7 @@ cmake -S . -B build-includes -G Ninja \
 ```
 
 The script checks every configured first-party source, including bindings, samples,
-tests and benchmarks. Disable optional targets above for a smaller check; skipped
+tests. Disable optional targets above for a smaller check; skipped
 files are listed explicitly. Installed-package consumers and the historical fixture
 generator have separate build configurations and must be checked in those contexts.
 The historical generator requires the pinned release headers described in
@@ -763,7 +762,7 @@ CMake exposes `rabitqlib::core`, `rabitqlib::fastscan` (depending on core) and
 `rabitqlib::index` (depending on FastScan). No upward header, object or symbol dependencies
 are allowed. For core alone disable `RABITQ_BUILD_INDEX` and `RABITQ_BUILD_FASTSCAN`.
 Install only enabled components and their dependencies; core-only installs exclude
-FastScan/index/clustering and vendored hnswlib. `benchmarks/core/` links only core.
+FastScan/index/clustering and vendored hnswlib.
 Python is a MODULE extension with build-tree alias `rabitqlib::python` and import name
 `rabitqlib`, not a C++ link library or installed C++ component.
 
@@ -960,7 +959,7 @@ Never bypass public dimension checks, unsupported-CPU errors or initialization s
 
 #### Hot-path measurements
 
-Keep performance regression workloads in [component hot-path benchmarks](../benchmarks/hotpaths/README.md).
+Keep performance regression workloads in the component hot-path benchmarks.
 Validate numerical results first, then inspect generated code and alternate comparable
 baseline/candidate runs. Keep failed experiments and quality results. Fusion, inlining,
 scratch reuse and dispatch changes need measurements across relevant vector sizes;
@@ -1094,10 +1093,10 @@ source groups/flags with all three dispatchers and `src/utils/cpu_features.cpp`.
 - Add backend-independent tests when introducing or changing SIMD kernels.
 - Keep scalar, NEON, AVX2, and AVX-512 implementations behaviorally equivalent.
 - Benchmark allocations or algorithm changes in search and quantization hot
-  paths, and substantiate performance claims with benchmarks. Run correctness
+  paths, and substantiate performance claims with measurements. Run correctness
   tests first and include commands, dataset, CPU, compiler, ISA, thread count,
   latency/throughput, and quality results in the pull request. Correctness fixes
-  may omit benchmarks with a documented justification; do not make unmeasured
+  may omit performance measurements with a documented justification; do not make unmeasured
   performance claims.
 - Preserve estimated-distance semantics. Before comparing recall, state the
   metric, workload, and acceptable recall tolerance, using repeated baseline

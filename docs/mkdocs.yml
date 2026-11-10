@@ -47,11 +47,6 @@ nav:
       - Zvec: integrations/zvec.md
   - Clustering: clustering.md
   - Papers and citations: papers.md
-  - Benchmarks:
-      - Overview: benchmarks/bench.md
-      - IVF indexes: benchmarks/ivf.md
-      - Graph indexes: benchmarks/graphs.md
-      - K-means: benchmarks/kmeans.md
 
 theme:
   name: material

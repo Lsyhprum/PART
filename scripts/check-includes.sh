@@ -155,7 +155,7 @@ for name in sorted(set(files) - {""}):
             jobs.append((file, f"private context {index + 1}", ["--"] + list(flags)))
         continue
     entry = base
-    for prefix in ("python_bindings", "tests", "sample", "benchmarks"):
+    for prefix in ("python_bindings", "tests", "sample"):
         if name.startswith(prefix + "/"):
             entry = representative(prefix)
             break

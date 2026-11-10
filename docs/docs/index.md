@@ -97,7 +97,7 @@ For input shapes, distance conventions, memory estimates, and threading, see
 
 The GIST1M numbers above are the fastest measured setting with Recall@10 ≥ 90%,
 using one search thread and one query per call with RaBitQ-Library 0.8.2; index
-size is serialized storage. See the [benchmark results](benchmarks/bench.md#key-results)
+size is serialized storage. See the benchmark results
 for datasets, baselines, settings, and limitations. Evaluate recall and query time
 on your own dataset when choosing an index.
 

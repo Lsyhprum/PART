@@ -12,10 +12,7 @@ only the affected job groups:
 | --- | --- |
 | Documentation and Markdown only | Documentation build for `docs/`; no C++ or Python builds; the documentation summary is always emitted |
 | Issue forms/configuration and CODEOWNERS | No C++/Python builds |
-| `benchmarks/core/`, `benchmarks/hotpaths/` code/build files | Ubuntu benchmark build and bounded smoke tests; C++ formatting or Python lint as applicable, without the wheel/platform matrix for benchmark-only edits |
-| `.github/workflows/test.yaml` | C++ checks, ShellCheck, Python quality (including summary-job tests), and benchmark smoke |
-| Known root benchmark Python scripts | Python lint and dataset-independent benchmark protocol tests; no index or wheel builds |
-| `tests/python/test_benchmark_protocol.py` | Python lint and benchmark protocol tests; no index or wheel builds |
+| `.github/workflows/test.yaml` | C++ checks, ShellCheck, Python quality (including summary-job tests) |
 | `.github/workflows/docs.yml` | Documentation build and Python quality checks for workflow regression tests |
 | `.github/workflows/pr-labels.yml` | Python quality, including metadata-classification regression tests |
 | `.github/release.yml` | Python quality, including release-category compatibility tests |
@@ -97,24 +94,6 @@ example, routing plus `scripts/check-python.sh` runs Python quality and ShellChe
 routing plus library code, build configuration, wheel-related inputs or unknown
 paths keeps the full selection. PR routing checks remain broad. An untagged version on `main` still forces full C++ and Python CI,
 even for a subsequent docs-only commit, before automatic publishing can proceed.
-
-## Benchmark smoke coverage
-
-`Benchmark build and smoke` uses one Ubuntu runner with benchmarks enabled,
-ordinary unit tests and samples disabled, native optimization disabled, and Python
-bindings enabled for the ID-conversion helper. It builds the targets and runs
-only their registered small CTest cases, with a 60-second per-test timeout.
-No dataset download, timing threshold, or performance comparison is run.
-
-The job also runs for shared library sources/headers, root/CMake build settings,
-Python bindings/package configuration, and changes to the Test workflow. Other
-unrecognized benchmark paths retain conservative full selection. All benchmark
-Python scripts are included in Python lint. Known root Python drivers and their
-protocol tests select the existing `Python formatting and linting` job, which
-also runs `tests/python/test_benchmark_protocol.py` with NumPy and pytest. These
-tests need no native package build, external dataset, or baseline installation.
-This is Linux build/functionality coverage, not a performance result or proof of
-every SIMD backend executing.
 
 ## Documentation and concurrency gates
 

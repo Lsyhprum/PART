@@ -171,10 +171,4 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -S "${WORK_DIR}/require-index"
 if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "rabitqlib")
     message(FATAL_ERROR "Core-only installation accepted the missing FastScan component")
 endif()
-run("${CMAKE_COMMAND}" -S "${RABITQ_SOURCE_DIR}/benchmarks/core"
-    -B "${WORK_DIR}/benchmark" ${configure_options}
-    "-DCMAKE_PREFIX_PATH=${WORK_DIR}/core/relocated")
-run("${CMAKE_COMMAND}" --build "${WORK_DIR}/benchmark" --config Release --parallel 2)
-run("${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/benchmark" -C Release
-    --output-on-failure --no-tests=error)
-message(STATUS "External consumers and core benchmark passed for: ${components}")
+message(STATUS "External consumers passed for: ${components}")
