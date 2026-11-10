@@ -198,29 +198,6 @@ The encoder validates that the layout and the query stride are consistent.
 (norm preservation, byte compatibility, and predicate-gate correctness for IVF
 and SymphonyQG indexes).
 
-**Paper-scale experiments** use the SIFT base/query vectors with generated
-attribute columns:
-
-- `A3_C100_w10` — three independent range attributes (layout `range,range,range`).
-- `MIX_EQ_C10_R100_w10` — one equality attribute plus one range attribute
-  (layout `eq,range`).
-
-Each experiment rotates the vectors (`--layout` per above), clusters the rotated
-base at `k = 4096`, builds a 32-bit IVF-RaBitQ index, and compares **no-rerank**
-vs **rerank (F = 5 / 10)**. Representative, dataset-independent findings:
-
-| Configuration | Recall@100 ceiling / convergence | Note |
-| --- | --- | --- |
-| No rerank (range) | ~0.956 | HAPR soft-filter ceiling in the original space |
-| Rerank F = 5 / 10 (range) | ~0.997 | original L2 rerank recovers true top-K |
-| No rerank (mixed) | ~0.948 | equality exact, range soft |
-| Rerank F = 10 (mixed) | ~0.998 | |
-
-The predicate gate reports `Predicate violations: 0` in every configuration,
-confirming the equality/range/mixed filters are applied correctly. The exact
-datasets and scripts used for the paper's figures are provided alongside the
-submission; the commands above are the minimal reproducible recipe.
-
 ---
 
 ## Relationship to RaBitQ-Library
@@ -242,7 +219,7 @@ python -m pytest tests/python                                  # Python bindings
 The Python suite includes path-handling tests that deliberately use non-ASCII
 filenames, confirming the bindings accept international (e.g. UTF-8 / CJK) paths.
 
-## Citation
+<!-- ## Citation
 
 If you use PART in your research, please cite the accompanying paper. The exact
 title, authors, and venue should be filled in from the paper:
@@ -257,7 +234,7 @@ title, authors, and venue should be filled in from the paper:
 ```
 
 PART builds on RaBitQ-Library (Gao et al.). Please also cite RaBitQ-Library
-where appropriate.
+where appropriate. -->
 
 ## License
 
