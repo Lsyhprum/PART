@@ -10,8 +10,8 @@
 //   a range predicate's match set is an "interval union" that cannot be pre-grouped by signature
 //   for sharing; this program instead applies a per-query [lo,hi] interval mask over the N rows,
 //   collects matching indices, then computes distances within the match subset and takes top-(K+M).
-//   Distances use float32 accumulation (same float32 precision as 2.verify_range_groundtruth.py,
-//   boundary difference <= 1e-6, exactly within the verifier's tolerance -> true top-K is in candidates).
+//   Distances use float32 accumulation (precision matched by the built-in self_check,
+//   boundary difference <= 1e-6, exactly within tolerance -> true top-K is in candidates).
 //
 // Depends only on libgomp and the standard library; no MKL / GPU / faiss needed.
 //

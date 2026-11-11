@@ -214,8 +214,7 @@ void run_rows(size_t rows, size_t num_threads, F&& body) {
 // ---------------------------------------------------------------------------
 // CPR (categorical disjoint-block) helpers.
 //
-// block_split_cpr mirrors scripts/_dataset_utils.py::cpr_block_split(scheme=
-// "contiguous"): partition the P dimension pairs into A contiguous, disjoint
+// block_split_cpr partitions the P dimension pairs into A contiguous, disjoint
 // blocks (the first P%A blocks get one extra pair). Every pair belongs to
 // exactly one attribute's block, so a CPR rotation touches each pair once.
 // ---------------------------------------------------------------------------
@@ -233,8 +232,8 @@ std::vector<std::pair<size_t, size_t>> block_split_cpr(size_t attr_dim, size_t p
     return blocks;
 }
 
-// Categorical hash phase for CPR, bit-identical to
-// scripts/_dataset_utils.py::_hash_to_phases_cpr:
+// Categorical hash phase for CPR (bit-identical layout to the attribute salt
+// protocol):
 //     h = (id * 2654435761) ^ (salt * 40503)
 //     h = (h ^ (h >> 15)) & 0x7FFFFFFF
 //     phase = (h / 0x7FFFFFFF) * 2.0 * pi

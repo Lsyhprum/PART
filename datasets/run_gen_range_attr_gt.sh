@@ -7,8 +7,7 @@
 # Each dataset is generated config-by-config (RANGE_CONFIGS) in sequence.
 # Detailed logs -> $LOG_DIR/gen_range_attr_gt_<ds>.log; progress -> gen_range_attr_gt_master.log.
 # Note: the generator has a built-in self_check (256 samples, same logic as the
-#   verifier). For stronger full independent re-verification, restore
-#   _single/2.verify_range_groundtruth.py and run it manually (archived; see _single/README.md).
+#   verifier) so no external verifier script is required.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
