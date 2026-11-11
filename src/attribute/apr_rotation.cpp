@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -208,6 +209,122 @@ void run_rows(size_t rows, size_t num_threads, F&& body) {
     for (size_t i = 0; i < rows; ++i) {
         body(i);
     }
+}
+
+// ---------------------------------------------------------------------------
+// CPR (categorical disjoint-block) helpers.
+//
+// block_split_cpr mirrors scripts/_dataset_utils.py::cpr_block_split(scheme=
+// "contiguous"): partition the P dimension pairs into A contiguous, disjoint
+// blocks (the first P%A blocks get one extra pair). Every pair belongs to
+// exactly one attribute's block, so a CPR rotation touches each pair once.
+// ---------------------------------------------------------------------------
+std::vector<std::pair<size_t, size_t>> block_split_cpr(size_t attr_dim, size_t pair_dim) {
+    std::vector<std::pair<size_t, size_t>> blocks;
+    blocks.reserve(attr_dim);
+    const size_t base = pair_dim / attr_dim;
+    const size_t rem = pair_dim % attr_dim;
+    size_t start = 0;
+    for (size_t a = 0; a < attr_dim; ++a) {
+        const size_t sz = base + (a < rem ? 1 : 0);
+        blocks.emplace_back(start, start + sz);
+        start += sz;
+    }
+    return blocks;
+}
+
+// Categorical hash phase for CPR, bit-identical to
+// scripts/_dataset_utils.py::_hash_to_phases_cpr:
+//     h = (id * 2654435761) ^ (salt * 40503)
+//     h = (h ^ (h >> 15)) & 0x7FFFFFFF
+//     phase = (h / 0x7FFFFFFF) * 2.0 * pi
+// id is a non-negative attribute value; salt is the per-(attribute, pair) salt
+// value read from the --salt-file (layout salt[a*P + j]). Computed in uint64 so
+// the modular arithmetic matches NumPy's int64 wraparound exactly; the final
+// & 0x7FFFFFFF makes arithmetic vs logical shift irrelevant for the kept bits.
+inline double hash_phase_cpr(uint32_t value, uint64_t salt) {
+    uint64_t h = static_cast<uint64_t>(value) * 2654435761ULL;
+    h ^= (salt & 0x7FFFFFFFULL) * 40503ULL;
+    h ^= (h >> 15);
+    h &= 0x7FFFFFFFULL;
+    return (static_cast<double>(h) / 2147483647.0) * 2.0 * kPi;
+}
+
+// Disjoint-block categorical rotation. Each attribute a rotates only its own
+// block of dimension pairs; out-of-block pairs are left untouched (and every
+// pair is covered by exactly one block). A per-attribute value->cos/sin table
+// keeps the hot loop to A table lookups plus P rotations per row.
+template <typename AttrT>
+void rotate_batch_cpr_impl(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const AttrT* attrs,
+    float* dst,
+    size_t num_threads
+) {
+    if (rows == 0) {
+        return;
+    }
+    if (src == nullptr || dst == nullptr || attrs == nullptr) {
+        throw std::invalid_argument("CPR rotate_batch buffers must not be null");
+    }
+    const size_t dim = plan.dim();
+    const size_t attr_dim = plan.attr_dim();
+    const size_t pair_dim = plan.pair_dim();
+    const uint64_t* salt = plan.salt();
+    if (salt == nullptr) {
+        throw std::invalid_argument("CPR plan has no salt");
+    }
+    if constexpr (std::is_same_v<AttrT, int32_t>) {
+        for (size_t i = 0; i < checked_mul(rows, attr_dim); ++i) {
+            if (attrs[i] < 0) {
+                throw std::invalid_argument(
+                    "CPR query targets must be non-negative; -1 wildcards require a "
+                    "multi-probe strategy"
+                );
+            }
+        }
+    }
+
+    const std::vector<std::pair<size_t, size_t>> blocks = block_split_cpr(attr_dim, pair_dim);
+    std::vector<std::unordered_map<uint32_t, std::vector<double>>> tables(attr_dim);
+    for (size_t i = 0; i < rows; ++i) {
+        for (size_t a = 0; a < attr_dim; ++a) {
+            const uint32_t v = static_cast<uint32_t>(attrs[i * attr_dim + a]);
+            auto& tbl = tables[a];
+            if (tbl.find(v) != tbl.end()) {
+                continue;
+            }
+            const auto& blk = blocks[a];
+            const size_t sz = blk.second - blk.first;
+            std::vector<double> cs(sz * 2);
+            for (size_t k = 0; k < sz; ++k) {
+                const size_t j = blk.first + k;
+                const double ph = hash_phase_cpr(v, salt[a * pair_dim + j]);
+                cs[2 * k] = std::cos(ph);
+                cs[2 * k + 1] = std::sin(ph);
+            }
+            tbl.emplace(v, std::move(cs));
+        }
+    }
+
+    run_rows(rows, num_threads, [&](size_t i) {
+        for (size_t a = 0; a < attr_dim; ++a) {
+            const uint32_t v = static_cast<uint32_t>(attrs[i * attr_dim + a]);
+            const auto& cs = tables[a].at(v);
+            const auto& blk = blocks[a];
+            for (size_t k = 0; k < blk.second - blk.first; ++k) {
+                const size_t j = blk.first + k;
+                const double c = cs[2 * k];
+                const double s = cs[2 * k + 1];
+                const double x0 = static_cast<double>(src[i * dim + 2 * j]);
+                const double x1 = static_cast<double>(src[i * dim + 2 * j + 1]);
+                dst[i * dim + 2 * j] = static_cast<float>(x0 * c - x1 * s);
+                dst[i * dim + 2 * j + 1] = static_cast<float>(x0 * s + x1 * c);
+            }
+        }
+    });
 }
 
 template <typename AttrT>
@@ -553,6 +670,75 @@ void rotate_vector_hapr(
     const AprRotationPlan& plan, const float* src, const double* values, float* dst
 ) {
     rotate_batch_hapr(plan, src, 1, values, dst, 0);
+}
+
+AprRotationPlan AprRotationPlan::make_cpr(
+    const AprConfig& config, const uint64_t* salt, size_t salt_len
+) {
+    validate_config(config);
+    if (config.predicate != PredicateKind::kEquality) {
+        throw std::invalid_argument("APR make_cpr() requires an all-equality layout");
+    }
+    if (salt == nullptr) {
+        throw std::invalid_argument("CPR salt must not be null");
+    }
+    const size_t expected = checked_mul(config.attr_dim, config.dim / 2);
+    if (salt_len != expected) {
+        throw std::invalid_argument("CPR salt length must equal attr_dim * (dim / 2)");
+    }
+    return AprRotationPlan(config, std::vector<uint64_t>(salt, salt + salt_len));
+}
+
+AprRotationPlan AprRotationPlan::make_cpr_standalone(
+    const AprConfig& config, uint64_t seed
+) {
+    validate_config(config);
+    if (config.predicate != PredicateKind::kEquality) {
+        throw std::invalid_argument(
+            "APR make_cpr_standalone() requires an all-equality layout"
+        );
+    }
+    const size_t count = checked_mul(config.attr_dim, config.dim / 2);
+    std::vector<uint64_t> salt(count);
+    uint64_t state = seed;
+    for (size_t i = 0; i < count; ++i) {
+        salt[i] = splitmix64_next(state) & 0x7FFFFFFFULL;
+    }
+    return AprRotationPlan(config, std::move(salt));
+}
+
+void rotate_batch_cpr(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const uint32_t* attrs,
+    float* dst,
+    size_t num_threads
+) {
+    rotate_batch_cpr_impl(plan, src, rows, attrs, dst, num_threads);
+}
+
+void rotate_batch_cpr(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const int32_t* attrs,
+    float* dst,
+    size_t num_threads
+) {
+    rotate_batch_cpr_impl(plan, src, rows, attrs, dst, num_threads);
+}
+
+void rotate_vector_cpr(
+    const AprRotationPlan& plan, const float* src, const uint32_t* attrs, float* dst
+) {
+    rotate_batch_cpr(plan, src, 1, attrs, dst, 0);
+}
+
+void rotate_vector_cpr(
+    const AprRotationPlan& plan, const float* src, const int32_t* attrs, float* dst
+) {
+    rotate_batch_cpr(plan, src, 1, attrs, dst, 0);
 }
 
 }  // namespace rabitqlib::attribute

@@ -1,49 +1,56 @@
 # Quick start
 
-Build, search, save and reload a small IVF-RaBitQ index from C++. This guide
-describes **0.8.3** and uses synthetic data, so no dataset download is required.
-For the full API reference and build options, see
-[C++ integration](cpp_integration.md). For platform details, see
-[Installation](installation.md).
+Build and query a PART IVF-RaBitQ index from C++ using the attribute fixture
+shipped with this repository, so no dataset download is required.
 
 ## Build the library
 
 From the repository root:
 
 ```bash
-cmake -S . -B build -DRABITQ_BUILD_INDEX=ON -DRABITQ_BUILD_SAMPLES=ON \
-    -DCMAKE_BUILD_TYPE=Release -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRABITQ_BUILD_SAMPLES=ON
 cmake --build build --parallel
 ```
 
-This builds the library and the `sample/cpp` command-line tools under `build/bin`
-(or `bin/`).
+`RABITQ_BUILD_INDEX`, `RABITQ_BUILD_FASTSCAN` and `RABITQ_USE_OPENMP` all
+default to `ON`. The sample command-line tools are written to `bin/` in the
+source tree (not `build/bin/`). For the full option list see
+[C++ integration](cpp_integration.md) and [Installation](installation.md).
 
-## Build and search an IVF-RaBitQ index (CLI)
+## Build and search an index
 
-The C++ samples reproduce the paper's pipeline without Python. For an
-attribute-aware (APR/HAPR) index, the workflow is:
+`ivf_part_pipeline` performs attribute rotation, centroid training, point
+routing and index saving in one process:
 
 ```bash
-# Learn attributes from the data, then encode them into the rotated space.
-./build/bin/attribute_apr_encode data.fvecs attr.fvecs rotated.fvecs 5 16
+fixture=./tests/fixtures/attribute
 
-# Build the IVF-RaBitQ index from the rotated (attribute-aware) vectors.
-./build/bin/ivf_rabitq_indexing rotated.fvecs index.bin 5 16
+./bin/ivf_part_pipeline \
+  --base "$fixture/qg_base_raw.fvecs" \
+  --query "$fixture/qg_query_raw.fvecs" \
+  --base-attr "$fixture/qg_base_attr.bin" \
+  --query-attr "$fixture/qg_query_attr.bin" \
+  --dim 64 --attr-dim 1 --standalone-seed 1234 \
+  --num-clusters 8 --bits 8 --out-dir ./data/part_ivf \
+  --gt "$fixture/qg_filtered_gt.ivecs" --nprobe 8 --topk 10
 
-# Search with an attribute predicate; only rows matching the predicate are returned.
-./build/bin/ivf_rabitq_querying index.bin queries.fvecs predicates.txt 10 5
+./bin/ivf_rabitq_querying ./data/part_ivf/part_ivf.index \
+  ./data/part_ivf/part_query.fvecs "$fixture/qg_filtered_gt.ivecs" \
+  --base-attr "$fixture/qg_base_attr.bin" \
+  --query-attr "$fixture/qg_query_attr.bin" --attr-dim 1
 ```
 
-`attribute_apr_encode` rotates the data so that the attribute predicate is
-enforced during search (HAPR); `ivf_rabitq_indexing` builds the quantizer and
-clusters, and `ivf_rabitq_querying` performs hard-filtered search. See
-[C++ integration](cpp_integration.md) for the exact arguments and the in-memory
-C++ API (`rabitqlib::index::IvfIndex`).
+`--gt` adds an in-process filtered-search smoke test (recall and predicate
+violations); the querying CLI prints the full `nprobe` / QPS / recall sweep.
+`sample/run_cpp.sh` runs the same commands. See the
+[README](../../README.md) for CPR, HAPR and reranking options.
 
 ## Save and reload
 
-`ivf_rabitq_indexing` writes a self-describing index file that
+`ivf_part_pipeline` writes a self-describing index file that
 `ivf_rabitq_querying` reloads directly; no separate serialization step is
-needed for the CLI workflow. The in-memory C++ API exposes `save`/`load`
-for embedding the index in your own service.
+needed for the CLI workflow. The C++ API behind it is `rabitqlib::ivf::IVF`
+(`rabitqlib/index/ivf/ivf.hpp`): construct it without a point count, call
+`train(...)` and `add(...)`, then `save(...)`. A search process calls
+`load(...)` before `search(...)` / `search_batch(...)`. See
+[C++ integration](cpp_integration.md) for build setup and the exact signatures.

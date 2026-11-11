@@ -15,8 +15,9 @@ experiments. It covers three attribute-filter types: equality, range, and mixed
 
 ## 0. Environment setup
 
-- **Python**: any interpreter providing `faiss` (1.12+) and `numpy`. Point to it via
-  the `PY` environment variable; the scripts default to `python3`.
+- **Python**: any interpreter providing `numpy` (the helpers are pure stdlib +
+  numpy; no faiss / GPU needed). Point to it via the `PY` environment variable;
+  the scripts default to `python3`.
 - **`PYTHONPATH` shim avoidance**: the entry scripts internally run with
   `env -u PYTHONPATH`; when invoking a single script manually you must add it too:
   ```bash
@@ -29,15 +30,14 @@ experiments. It covers three attribute-filter types: equality, range, and mixed
 
 ## 1. File inventory and responsibilities
 
-All Python scripts depend **only** on the shared file `_dataset_utils.py` (the rest
-are stdlib / numpy / faiss).
+The three `gen_*_attr_gt.py` generators share `_dataset_utils.py`; everything else is
+stdlib / numpy.
 
 ### Shared library
 | File | Role |
 |---|---|
-| `_dataset_utils.py` | The only shared dependency. faiss brute-force nearest neighbor; fvecs/ivecs read-write; self-describing header attribute-bin read-write and headerless-compatible read (`load_attr`); filtered-gt recomputation `recompute_gt` (equality) / `recompute_gt_range` (range); tie-tolerant top-K legal set `topk_legal_set`; disjoint rotation encoding; `recall_at_k` |
+| `_dataset_utils.py` | The only shared dependency of the three `gen_*_attr_gt.py` generators. fvecs / ivecs read (`fvecs_read`, `ivecs_read`) and ivecs write (`ivecs_write`); self-describing header attribute-bin read-write (`attr_bin_write` / `attr_bin_read`) and headerless-compatible read (`load_attr`); equality filtered-gt recomputation (`recompute_gt`); tie-tolerant top-K legal set (`topk_legal_set`). Pure stdlib + numpy, no GPU / faiss, and no rotation encoding (that lives in the C++ library) |
 | `config.cfg` | **Unified parameter config**: all runtime parameters of the three entry scripts (interpreter / log dir / dataset root / dataset list / selectivity config / metric map / K / seed / margin / threads / self-check switch). Tune here only; no `.py`/`.sh` edits needed (see section 3) |
-| `port_arxiv_em.py` | Ports the real arxiv EM (exact-match) attribute labels 1:1 onto sift / msmarco / openai1536, reusing `compute_eq_attr_gt.cpp` + `recompute_gt` to regenerate attribute-filtered gt; self-contained (no faiss dependency) |
 
 ### Workflow A: equality-attribute batch generation
 | File | Role |
@@ -121,7 +121,7 @@ behavior; a missing config file aborts with an error. Relative paths (`LOG_DIR` 
 
 | Key | Default | Applies to | Description |
 |---|---|---|---|
-| `PY` | `python3` | all | Python interpreter (must provide faiss + numpy) |
+| `PY` | `python3` | all | Python interpreter (needs numpy only; no faiss / GPU) |
 | `LOG_DIR` | `./_log` | all | Log directory (master progress + per-dataset logs) |
 | `DATASET_ROOT` | `..` | all | Dataset root; scripts address `<DATASET_ROOT>/<ds>/<ds>_base.fvecs` |
 | `NO_VERIFY` | `0` | all | 1 = skip the 256-sample self-check inside the generator |
@@ -196,6 +196,6 @@ rm -f compute_eq_attr_gt compute_range_attr_gt compute_mix_attr_gt   # auto-reco
    progress, `gen_eq_attr_gt_<ds>.log` etc. are per-dataset details. This directory
    is git-ignored.
 4. The metric must match the dataset (see the section 2 map).
-5. Scripts involving faiss need a GPU environment; `_dataset_utils.py` sets
-   `CUDA_VISIBLE_DEVICES` only if it is **not already set** in your environment
-   (default `0`), so you can control the device via that environment variable.
+5. No faiss / GPU is required: the Python helpers are pure stdlib + numpy and the
+   C++ candidate generators need only `g++` + OpenMP. `_dataset_utils.py` no
+   longer sets `CUDA_VISIBLE_DEVICES`.

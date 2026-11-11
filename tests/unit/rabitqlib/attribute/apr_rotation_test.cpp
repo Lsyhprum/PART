@@ -268,5 +268,101 @@ TEST(AprRotationTest, RejectsInvalidConfigAndInputs) {
     EXPECT_NO_THROW((rotate_batch(plan, vector, 0, attr, output, 0)));
 }
 
+TEST(AprRotationTest, CprPreservesNormsAndMatchedDistances) {
+    constexpr size_t kDim = 8;
+    constexpr size_t kAttrDim = 2;
+    const AprRotationPlan plan =
+        AprRotationPlan::make_cpr_standalone(AprConfig{kDim, kAttrDim}, 12345);
+    std::array<float, kDim> base{}, query{};
+    for (size_t j = 0; j < kDim; ++j) {
+        base[j] = static_cast<float>(j + 1);
+        query[j] = static_cast<float>(2 * (j + 1));
+    }
+    const uint32_t attr[2] = {3, 7};
+    std::array<float, kDim> rotated_base{};
+    std::array<float, kDim> rotated_query{};
+    rotate_vector_cpr(plan, base.data(), attr, rotated_base.data());
+    rotate_vector_cpr(plan, query.data(), attr, rotated_query.data());
+
+    EXPECT_NEAR(SquaredNorm(rotated_base.data(), kDim), SquaredNorm(base.data(), kDim),
+                1e-3);
+    EXPECT_NEAR(SquaredNorm(rotated_query.data(), kDim),
+                SquaredNorm(query.data(), kDim), 1e-3);
+    EXPECT_NEAR(SquaredDistance(rotated_base.data(), rotated_query.data(), kDim),
+                SquaredDistance(base.data(), query.data(), kDim), 1e-3);
+}
+
+TEST(AprRotationTest, CprBlocksAreDisjoint) {
+    constexpr size_t kDim = 8;
+    constexpr size_t kAttrDim = 2;
+    const AprRotationPlan plan =
+        AprRotationPlan::make_cpr_standalone(AprConfig{kDim, kAttrDim}, 777);
+    std::array<float, kDim> vec{};
+    for (size_t j = 0; j < kDim; ++j) {
+        vec[j] = static_cast<float>(static_cast<int>(j) - 4);
+    }
+    const uint32_t a0[2] = {1, 5};
+    const uint32_t a1[2] = {1, 9};  // only attribute 1 differs
+    std::array<float, kDim> r0{};
+    std::array<float, kDim> r1{};
+    rotate_vector_cpr(plan, vec.data(), a0, r0.data());
+    rotate_vector_cpr(plan, vec.data(), a1, r1.data());
+    // Attribute 0 owns pairs 0,1 (coords 0..3); changing attribute 1 must not
+    // perturb them.
+    for (size_t j = 0; j < 4; ++j) {
+        EXPECT_FLOAT_EQ(r0[j], r1[j]) << "coord " << j;
+    }
+    // Attribute 1 owns pairs 2,3 (coords 4..7); they must differ.
+    bool differs = false;
+    for (size_t j = 4; j < 8; ++j) {
+        if (r0[j] != r1[j]) {
+            differs = true;
+        }
+    }
+    EXPECT_TRUE(differs);
+}
+
+TEST(AprRotationTest, CprParallelMatchesSerial) {
+    constexpr size_t kDim = 16;
+    constexpr size_t kAttrDim = 4;
+    const AprRotationPlan plan =
+        AprRotationPlan::make_cpr_standalone(AprConfig{kDim, kAttrDim}, 55);
+    std::vector<float> vec(kDim);
+    std::vector<uint32_t> attrs(kAttrDim);
+    for (size_t j = 0; j < kDim; ++j) {
+        vec[j] = static_cast<float>(std::sin(static_cast<double>(j)));
+    }
+    for (size_t a = 0; a < kAttrDim; ++a) {
+        attrs[a] = static_cast<uint32_t>(a * 13 + 1);
+    }
+    std::vector<float> serial(kDim), parallel(kDim);
+    rotate_batch_cpr(plan, vec.data(), 1, attrs.data(), serial.data(), 0);
+    rotate_batch_cpr(plan, vec.data(), 1, attrs.data(), parallel.data(), 2);
+    EXPECT_EQ(serial, parallel);
+}
+
+TEST(AprRotationTest, CprRejectsInvalidConfig) {
+    constexpr std::array<uint64_t, 4> kSalt = {
+        9008465316566228445ULL, 3506686710911391296ULL,
+        8515443495629954650ULL, 2413686584519761735ULL};
+    // Wrong salt length.
+    EXPECT_THROW(
+        (AprRotationPlan::make_cpr(AprConfig{8, 1}, kSalt.data(), 3)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (AprRotationPlan::make_cpr(AprConfig{8, 1}, nullptr, 4)),
+        std::invalid_argument);
+    // Odd dimension.
+    EXPECT_THROW(
+        (AprRotationPlan::make_cpr(AprConfig{7, 1}, kSalt.data(), 4)),
+        std::invalid_argument);
+    // Non-equality predicate.
+    EXPECT_THROW(
+        (AprRotationPlan::make_cpr(
+            AprConfig{8, 1, PredicateKind::kRange, WildcardPolicy::kReject, 1.0},
+            kSalt.data(), 4)),
+        std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace rabitqlib::attribute

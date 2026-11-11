@@ -4,7 +4,9 @@
 # across (dataset x attribute config x quantization bits), and produce
 # qps-recall tradeoff curves and a summary CSV.
 #
-# Log naming convention (produced by run.sh):
+# Log naming convention matched by FILE_PAT below (legacy [RESULT] logs from
+# the external SymphonyQG baseline sweep; this repository's sample CLIs print
+# EF/QPS/Recall tables instead of [RESULT] lines):
 #   bit=0 : {LOG_DIR}/symqg_{DATASET}_A{ATTR_DIM}_C{ATTR_CARD}_inline.log
 #   bit>0 : {LOG_DIR}/symqg_{DATASET}_A{ATTR_DIM}_C{ATTR_CARD}_inline_b{BITS}.log
 # Example line:

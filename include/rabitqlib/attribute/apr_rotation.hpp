@@ -48,6 +48,14 @@ class AprRotationPlan {
         double range_l
     );
 
+    // CPR (categorical disjoint-block) factories. The salt contract matches
+    // make()/make_standalone() (attr_dim blocks of dim/2 uint64), so the same
+    // salt file layout is shared across the encoders.
+    static AprRotationPlan make_cpr(
+        const AprConfig& config, const uint64_t* salt, size_t salt_len
+    );
+    static AprRotationPlan make_cpr_standalone(const AprConfig& config, uint64_t seed);
+
     [[nodiscard]] size_t dim() const { return config_.dim; }
     [[nodiscard]] size_t attr_dim() const { return config_.attr_dim; }
     [[nodiscard]] size_t pair_dim() const { return pair_dim_; }
@@ -119,6 +127,38 @@ void rotate_batch_hapr(
 );
 void rotate_vector_hapr(
     const AprRotationPlan& plan, const float* src, const double* values, float* dst
+);
+
+// CPR (categorical disjoint-block) entry point. Unlike APR/HAPR, the A attributes
+// do NOT share every dimension pair: block_split partitions the P pairs into A
+// disjoint, contiguous blocks, and attribute a rotates only its own block. The
+// phase for pair j inside attribute a's block is the categorical hash phase
+// hash(value_a, salt[a*P + j]) == (value*2654435761) ^ (salt*40503), matching
+// the former Python CPR encoder so existing rotated datasets stay reproducible
+// from the same --salt-file. The salt contract (attr_dim blocks of dim/2 uint64)
+// matches make()/make_standalone() so the two encoders share the same salt file
+// layout.
+void rotate_batch_cpr(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const uint32_t* attrs,
+    float* dst,
+    size_t num_threads = 0
+);
+void rotate_batch_cpr(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const int32_t* attrs,
+    float* dst,
+    size_t num_threads = 0
+);
+void rotate_vector_cpr(
+    const AprRotationPlan& plan, const float* src, const uint32_t* attrs, float* dst
+);
+void rotate_vector_cpr(
+    const AprRotationPlan& plan, const float* src, const int32_t* attrs, float* dst
 );
 
 }  // namespace rabitqlib::attribute

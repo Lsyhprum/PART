@@ -87,9 +87,10 @@ cmake --build build --parallel
 ctest --no-tests=error --test-dir build --output-on-failure
 ```
 
-The CLI tools are produced under `build/bin/` (or `bin/` for an in-tree build):
-`attribute_apr_encode`, `ivf_rabitq_indexing`, `ivf_rabitq_querying`, and the
-SymphonyQG / HNSW equivalents.
+The CLI tools are produced under `bin/` in the source tree:
+`ivf_part_pipeline`, `attribute_apr_encode`, `attribute_cpr_encode`,
+`ivf_rabitq_indexing`, `ivf_rabitq_querying`, and the SymphonyQG / HNSW
+equivalents.
 
 Key CMake options: `RABITQ_BUILD_INDEX`, `RABITQ_BUILD_FASTSCAN`,
 `RABITQ_BUILD_SAMPLES`, `RABITQ_BUILD_TESTS`, and `RABITQ_USE_OPENMP`
@@ -101,10 +102,52 @@ reference protocol exactly.
 
 ## Attribute-rotation pipeline (end to end)
 
-The paper's filtered-search recipe has four steps. **The index is built on the
-rotated vectors, never on the original vectors.**
+**The index is built on the rotated vectors, never on the original vectors.**
+The recommended path is one process: `ivf_part_pipeline` rotates the vectors,
+trains centroids with the library's own k-means, routes every point to its
+nearest centroid and saves the index. It writes no `centroids.fvecs` /
+`cluster_ids.ivecs` intermediates and needs no external clustering tool.
 
-### 1. Encode attributes as rotation
+### One-shot build and search
+
+```bash
+# Build: rotate + train + route + save, with an optional filtered-search smoke test.
+./bin/ivf_part_pipeline \
+  --base <base.fvecs> --query <query.fvecs> \
+  --base-attr <base_attr.bin> --query-attr <query_attr.bin> \
+  --dim 128 --attr-dim 2 --standalone-seed 1234 \
+  --num-clusters 4096 --bits 8 --metric l2 --threads 32 \
+  --out-dir data/part_ivf \
+  --gt GT.ivecs --nprobe 32 --topk 100
+
+# Search: full nprobe/QPS/recall sweep, predicate gate and optional rerank.
+./bin/ivf_rabitq_querying data/part_ivf/part_ivf.index \
+  data/part_ivf/part_query.fvecs GT.ivecs \
+  --base-attr <base_attr.bin> --query-attr <query_attr.bin> --attr-dim 2
+```
+
+Use `--encoder cpr` for CPR, or `--layout eq,range --range-l L` for HAPR
+(`--layout` / `--range-l` are APR-only). `--standalone-seed`, `--index-seed`
+and `--cluster-seed` independently control the attribute salt, the IVF rotator
+and the k-means training. [Quick start](docs/docs/quick_start.md) gives the same
+two commands against the bundled fixture (no dataset download); the IVF branch
+of `sample/run_cpp.sh` uses them too.
+
+> **Index compatibility.** The one-shot pipeline uses
+> `default_training_parameters` (10 iterations, at most 256 sampled points per
+> centroid) and exact `Flat` routing. Its centroids differ from those of the
+> faiss-based flow below, so recall/QPS numbers are **not directly comparable**;
+> rebuild every index and cached result when switching flows.
+> `scripts/faiss_clustering.py` and `ivf_rabitq_indexing` are retained only for
+> reproducing the faiss-centroid baseline.
+
+### Baseline reproduction (four explicit steps)
+
+The following splits the same build into separate tools. It is useful when
+centroids must come from a specific external k-means, but is no longer required
+for a normal build.
+
+#### 1. Encode attributes as rotation
 
 ```bash
 ./bin/attribute_apr_encode \
@@ -123,14 +166,48 @@ plain-text `hapr_meta.txt` recording the layout and `range_l`. The rotation is
 deterministic given `--standalone-seed` (PART's own salt derivation) or an
 explicit `--salt-file`.
 
-### 2. Cluster the rotated vectors
+**CPR (categorical disjoint-block) encoding** uses a separate CLI with the same
+arguments (it has no `--layout`; every column is an equality column):
 
-Cluster the rotated base with `k = 4096` (any k-means; faiss is convenient) and
-write the centroids as `centroids.fvecs` and each point's nearest-centroid
-assignment as `cluster_ids.ivecs` (one `int32` per point). The centroids and
-assignments must live in the *same* rotated space as the index input.
+```bash
+./bin/attribute_cpr_encode \
+  --base <base.fvecs> --query <query.fvecs> \
+  --base-attr <base_attr.bin> --query-attr <query_attr.bin> \
+  --dim 128 --attr-dim 2 \
+  --standalone-seed 1234 \
+  --out-dir data/cpr
+```
 
-### 3. Build the IVF-RaBitQ index on rotated vectors
+It writes `cpr_base.fvecs` / `cpr_query.fvecs`. Unlike APR, the `attr_dim`
+attributes own **disjoint** blocks of dimension pairs, so each pair is rotated
+by exactly one attribute. `ivf_part_pipeline` selects the encoder with
+`--encoder apr|cpr` (default `apr`). For SymphonyQG graph indexes, use the
+standalone encoders together with the build/query commands in
+[`docs/attribute-rotation.md`](docs/attribute-rotation.md).
+
+All three rotations (APR equality, HAPR range, CPR disjoint) are produced by
+C++ only; the Python `scripts/` helpers are limited to range-predicate and
+groundtruth generation.
+
+> **Salt compatibility.** The offline pipelines now pass `--standalone-seed`,
+> which derives the salt with a pure-C++ splitmix generator. Rotations produced
+> this way are **not** byte-compatible with the older NumPy-generated
+> `default_rng` salt (or with previously published APR/CPR rotated datasets).
+> Any rotated datasets, indexes, and cached results must be **regenerated**
+> after switching. Pass `--salt-file` to reproduce the NumPy-exact protocol
+> instead.
+
+#### 2. Cluster the rotated vectors (baseline only)
+
+Cluster the rotated base with `k = 4096` and write the centroids as
+`centroids.fvecs` and each point's nearest-centroid assignment as
+`cluster_ids.ivecs` (one `int32` per point). The centroids and assignments must
+live in the *same* rotated space as the index input.
+`scripts/faiss_clustering.py` is the retained baseline helper that emits both
+formats via `--centroids-out` / `--cids-out`; `bin/qgkmeans` and
+`bin/rabitqkmeans` are the pure-C++ alternatives.
+
+#### 3. Build the IVF-RaBitQ index on rotated vectors
 
 ```bash
 ./bin/ivf_rabitq_indexing \
@@ -141,7 +218,7 @@ assignments must live in the *same* rotated space as the index input.
 (`32` is the code width in bits; `false` disables the faster raw-vector
 rerank path inside the index — PART supplies its own reranking in step 4.)
 
-### 4. Query with the predicate gate, optionally reranked
+#### 4. Query with the predicate gate, optionally reranked
 
 ```bash
 # No rerank: fast, but range/mixed recall is capped by the soft filter.

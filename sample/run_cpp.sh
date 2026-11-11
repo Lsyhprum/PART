@@ -20,12 +20,24 @@ tar -xzvf ./data/gist/gist.tar.gz -C ./data
 
 ./bin/symqg_querying ./data/gist/symqg_32.index ./data/gist/gist_query.fvecs ./data/gist/gist_groundtruth.ivecs
 
-# Cluster with QGKMeans, then build and query an IVF index.
-./bin/qgkmeans ./data/gist/gist_base.fvecs 4096 ./data/gist/gist_centroids_4096.fvecs ./data/gist/gist_clusterids_4096.ivecs
+# One-shot PART IVF pipeline on the bundled attribute fixture: rotate the
+# vectors, train centroids in-process and save the index, then evaluate it with
+# the predicate-filtered query CLI. No clustering intermediate files needed.
+fixture=./tests/fixtures/attribute
+./bin/ivf_part_pipeline \
+    --base "$fixture/qg_base_raw.fvecs" \
+    --query "$fixture/qg_query_raw.fvecs" \
+    --base-attr "$fixture/qg_base_attr.bin" \
+    --query-attr "$fixture/qg_query_attr.bin" \
+    --dim 64 --attr-dim 1 --standalone-seed 1234 \
+    --num-clusters 8 --bits 8 --threads 4 \
+    --gt "$fixture/qg_filtered_gt.ivecs" --nprobe 8 --topk 10 \
+    --out-dir ./data/part_ivf
 
-./bin/ivf_rabitq_indexing ./data/gist/gist_base.fvecs ./data/gist/gist_centroids_4096.fvecs ./data/gist/gist_clusterids_4096.ivecs 3 ./data/gist/ivf_4096_3.index
-
-./bin/ivf_rabitq_querying ./data/gist/ivf_4096_3.index ./data/gist/gist_query.fvecs ./data/gist/gist_groundtruth.ivecs
+./bin/ivf_rabitq_querying ./data/part_ivf/part_ivf.index \
+    ./data/part_ivf/part_query.fvecs "$fixture/qg_filtered_gt.ivecs" \
+    --base-attr "$fixture/qg_base_attr.bin" \
+    --query-attr "$fixture/qg_query_attr.bin" --attr-dim 1
 
 # Cluster with RaBitQKMeans, then build and query an HNSW index.
 ./bin/rabitqkmeans ./data/gist/gist_base.fvecs 16 ./data/gist/gist_centroids_16.fvecs ./data/gist/gist_clusterids_16.ivecs

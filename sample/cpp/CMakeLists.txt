@@ -19,6 +19,13 @@ rabitq_configure_target(attribute_apr_encode)
 set_target_properties(attribute_apr_encode PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
 
+# CPR (categorical disjoint-block) offline encoder, same dependency as APR.
+add_executable(attribute_cpr_encode attribute_cpr_encode.cpp)
+target_link_libraries(attribute_cpr_encode PRIVATE rabitqlib::core)
+rabitq_configure_target(attribute_cpr_encode)
+set_target_properties(attribute_cpr_encode PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+
 if(NOT RABITQ_BUILD_INDEX)
     return()
 endif()
@@ -33,6 +40,9 @@ add_executable(rabitqkmeans rabitqkmeans.cpp)
 add_executable(ivf_rabitq_indexing ivf_rabitq_indexing.cpp)
 add_executable(ivf_rabitq_querying ivf_rabitq_querying.cpp)
 
+# One-shot PART pipeline: rotation + centroid training + IVF build in one process.
+add_executable(ivf_part_pipeline ivf_part_pipeline.cpp)
+
 add_executable(hnsw_rabitq_indexing hnsw_rabitq_indexing.cpp)
 add_executable(hnsw_rabitq_querying hnsw_rabitq_querying.cpp)
 
@@ -43,6 +53,7 @@ foreach(RABITQ_SAMPLE_TARGET
     rabitqkmeans
     ivf_rabitq_indexing
     ivf_rabitq_querying
+    ivf_part_pipeline
     hnsw_rabitq_indexing
     hnsw_rabitq_querying
 )

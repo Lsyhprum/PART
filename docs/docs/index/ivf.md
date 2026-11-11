@@ -13,10 +13,12 @@ width, number of clusters, and `nprobe`.
 
 ### Python
 
-The [complete Quick Start](../quick_start.md) is the runnable IVF-RaBitQ example:
-create an index, `add` the vectors (the first `add` trains the centroids), search,
-then save and reload it. [Training](#training-centroids-in-python) describes the
-clustering options, and the update examples below reuse the Quick Start's `index`.
+The [complete Quick Start](../quick_start.md) is a runnable C++ CLI example:
+`bin/ivf_part_pipeline` builds an attribute-rotated index in one process and
+`bin/ivf_rabitq_querying` searches it. The Python `IvfIndex` API described
+elsewhere in this document belongs to the upstream `rabitqlib` wheel, which
+this repository does not build. [Training](#training-centroids-in-python)
+describes the clustering options for that external wheel.
 
 ### C++
 
@@ -57,12 +59,19 @@ See [C++ integration](../cpp_integration.md) for build setup and
 
 Results contain IDs and squared L2 or `1 - dot` distances, ordered from smallest
 to largest. Quantized distances are estimates. Unfilled slots use ID `2**32 - 1`
-and distance `+inf`; see [result handling](../quick_start.md#read-the-results).
+and distance `+inf`; see the [Quick Start](../quick_start.md#build-and-search-an-index).
 See the shared [input and concurrency contracts](usage.md).
 
 ## Index construction
 
 See the shared [index count contract](usage.md#index-counts).
+
+For PART's attribute-aware workflow, `bin/ivf_part_pipeline` does everything in
+one process: it rotates base and query vectors with their attributes, trains
+centroids via `IVF::train`, routes and quantizes points with `IVF::add`, then
+saves the index and the rotated query. No centroids / cluster-ID files are
+written. See the [Quick Start](../quick_start.md) for a runnable command. The
+explicit `qgkmeans` route below is kept for baseline reproduction.
 
 Use [QGKMeans](../clustering.md#qgkmeans) to partition the input vectors (`.fvecs`).
 Build the C++ examples, then run `bin/qgkmeans` to save centroids and cluster IDs.

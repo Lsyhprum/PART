@@ -68,7 +68,7 @@ still change results. Loading restores the saved rotation.
 
 Results use squared L2 or `1 - dot` estimates, ordered from smallest to largest.
 Python fills missing results with ID `2**32 - 1` and distance `+inf`; C++ returns
-only the available pairs. See [result handling](../quick_start.md#read-the-results)
+only the available pairs. See the [Quick Start](../quick_start.md#build-and-search-an-index)
 and the shared [input, count and concurrency contracts](usage.md).
 
 ## Index construction
