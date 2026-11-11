@@ -14,10 +14,10 @@ Refresh APT package lists with `sudo apt-get update` before installing tools.
 | Task | Start here |
 | --- | --- |
 | Set up development tools | [Compiler and tool versions](#compiler-and-tool-versions) |
-| Format or lint changes | [C++](#c-formatting), [Python](#python-formatting-and-linting), [shell scripts](#shell-scripts), [static analysis](#static-analysis) |
+| Format or lint changes | [C++](#c-formatting), [shell scripts](#shell-scripts), [static analysis](#static-analysis) |
 | Change module boundaries or the stable API | [Module build boundaries](#module-build-boundaries), [stable core API](#stable-core-api-changes) |
 | Change numerical kernels or layouts | [SIMD recipe](#add-or-change-a-simd-kernel), [quantization and packing](#change-quantization-or-packing), [dimensions](#rotation-and-padded-dimensions), [dispatch reference](#dispatch-conventions-and-coverage) |
-| Change index or Python APIs | [Index API](#change-an-index-api), [Python bindings and type checks](#change-python-bindings) |
+| Change index APIs | [Index API](#change-an-index-api) |
 | Change persistence or object state | [Persistence](#change-persistence), [validation and ownership](#validation-ownership-and-numerical-preparation), [exception safety](#exception-safe-state-updates) |
 | Check naming conventions | [Indexes](#index-variable-names), [numerical modules](#numerical-module-variable-names) |
 | Evaluate performance or prepare a release | [Performance and compatibility](#performance-and-compatibility), [downstream checks](#downstream-compatibility-validation) |
@@ -50,9 +50,8 @@ factors estimate L2 distance or inner product.
 | `src/index/` | Compiled IVF/HNSW/SymphonyQG operations and private search kernels |
 | `src/utils/cpu_features.cpp` | Generic CPU feature detection |
 | `include/rabitqlib/utils/` | Shared allocation, I/O and numerical helpers; index buffers live in `index/detail/` |
-| `python_bindings/` | pybind11 extension, index wrappers and the provisional `rabitqlib.quant` module (`quant_bindings.cpp`, `quant.py`) |
-| `sample/cpp/`, `sample/python/` | Usage examples |
-| `tests/unit/`, `tests/python/` | C++ reference/unit tests and Python boundary/integration tests |
+| `sample/cpp/` | Usage examples |
+| `tests/unit/` | C++ reference/unit tests |
 | `docs/docs/` | MkDocs site sources |
 
 ## Development checks
@@ -61,7 +60,7 @@ factors estimate L2 distance or inner product.
 
 Library builds require C++17; the LLVM 23 development tools below do not impose a
 Clang 23 minimum on downstream users. CMake respects the caller's compiler choice.
-OpenMP is required for ANN indexes and Python bindings, and optional for core/FastScan.
+OpenMP is required for ANN indexes and optional for core/FastScan.
 
 Linux CI explicitly builds and tests with Clang 23, including installed consumers
 and OpenMP ON/OFF numerical builds, alongside the existing GCC jobs. Native ARM64,
@@ -119,34 +118,13 @@ To format only lines changed in the staged files, use:
 The complete-file formatter remains useful before the initial formatting pass
 or after changing `.clang-format`; CI always checks complete files.
 
-### Python formatting and linting
-
-Python sources, examples, and tests use Ruff 0.16.1:
-
-```bash
-python -m pip install "ruff==0.16.1"
-./scripts/check-python.sh
-```
-
-To apply Python formatting and safe automatic lint fixes before running the
-check:
-
-```bash
-ruff check --fix python_bindings sample/python tests/python tests/test_mypy.py tests/test_pyright.py
-ruff format python_bindings sample/python tests/python tests/test_mypy.py tests/test_pyright.py
-```
-
-`check-python.sh` does not cover the CI automation in `.github/scripts`; CI also
-runs `ruff format --check .github/scripts` and `ruff check .github/scripts`, so
-run both after changing those scripts.
-
 ### Shell scripts
 
 Run ShellCheck after changing a contributor or automation script:
 
 ```bash
 sudo apt-get install shellcheck
-shellcheck scripts/*.sh sample/run_cpp.sh sample/run_python.sh
+shellcheck scripts/*.sh sample/run_cpp.sh
 ```
 
 This matches CI's script set. Also pass any changed shell scripts outside
@@ -181,27 +159,22 @@ only sees `src/`, needs GNU binutils, and does not cover MSVC or ARM-only builds
 clang-tidy performs semantic checks and is kept separate from clang-format.
 The required baseline contains focused correctness, portability, and
 performance checks. Install the pinned analyzer and the dependencies needed to
-configure the core library and Python bindings:
+configure the core library:
 
 ```bash
 sudo apt-get install clang-23 clang-tidy-23 libomp-23-dev cmake ninja-build
-python -m pip install "numpy>=1.23" "pybind11>=2.12"
 ```
 
-Then configure the same core library and Python binding targets analyzed by CI
-and run the check with the same compiler used by CMake:
+Then configure the same core library targets analyzed by CI and run the check
+with the same compiler used by CMake:
 
 ```bash
-export pybind11_DIR="$(python -m pybind11 --cmakedir)"
 cmake -S . -B build-tidy -G Ninja \
     -DCMAKE_CXX_COMPILER=clang++-23 \
-    -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
     -DRABITQ_BUILD_SAMPLES=OFF \
     -DRABITQ_BUILD_TESTS=OFF \
-    -DRABITQ_BUILD_PYTHON_BINDINGS=ON \
     -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF \
-    -DCMAKE_BUILD_TYPE=Release \
-    -Dpybind11_DIR="$pybind11_DIR"
+    -DCMAKE_BUILD_TYPE=Release
 CXX=clang++-23 ./scripts/check-tidy.sh build-tidy
 ```
 
@@ -248,17 +221,14 @@ for LLVM 23, that is `libomp-23-dev`. An older installed
 ```bash
 cmake -S . -B build-includes -G Ninja \
   -DCMAKE_CXX_COMPILER="${CXX:-clang++-23}" \
-  -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
-  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
   -DRABITQ_BUILD_SAMPLES=ON \
   -DRABITQ_BUILD_TESTS=ON \
-  -DRABITQ_BUILD_PYTHON_BINDINGS=ON \
   -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF \
   -DCMAKE_BUILD_TYPE=Release
 ./scripts/check-includes.sh build-includes
 ```
 
-The script checks every configured first-party source, including bindings, samples,
+The script checks every configured first-party source, including samples,
 tests. Disable optional targets above for a smaller check; skipped
 files are listed explicitly. Installed-package consumers and the historical fixture
 generator have separate build configurations and must be checked in those contexts.
@@ -277,8 +247,7 @@ the working tree are skipped. `INCLUDE_JOBS` controls parallelism (default: 2), 
 `PYTHON` can select the existing project interpreter for the driver.
 
 Vendored files are excluded. The check ignores suggestions to include Eigen/hnswlib
-implementation headers behind their public entry points, and pybind11's internal
-`detail/common.h` behind `PYBIND11_MODULE`. These vendor headers lack the export
+implementation headers behind their public entry points. These vendor headers lack the export
 annotations needed by Include Cleaner. First-party export annotations describe
 intentional API re-exports; `keep` annotations retain configuration-only includes
 and explicit header-compilation tests. Neither is a general unused-include waiver.
@@ -515,8 +484,8 @@ SymphonyQG supports raw storage (`quantization_bits == 0`) and quantized storage
 
 ### Change an index API
 
-Update the C++ declaration/implementation, the corresponding file in `python_bindings/`, Python
-type stubs, tests, samples, and the relevant page under `docs/docs/index/`. Preserve public signatures where
+Update the C++ declaration/implementation, the tests, samples, and the relevant
+page under `docs/docs/index/`. Preserve public signatures where
 possible; add a forwarding overload when evolving an API compatibly. Index construction
 and buffer changes must also preserve the [ID marker](#search-buffer-id-marker) and
 [borrowed-input lifetimes](#ownership-during-construction).
@@ -530,7 +499,7 @@ on Windows and preserves existing path bytes on Linux/macOS.
 
 For path-only changes, check path conversion and the affected I/O operations; the
 format audit below applies when serialized data or its interpretation changes.
-Python path callbacks also follow the [binding rules](#change-python-bindings).
+
 
 ### Change persistence
 
@@ -552,45 +521,6 @@ compatibility test fixture or an explicit rejection path. Review each affected f
 changes to shared serialization helpers require auditing every format using them.
 IVF-RaBitQ, HNSW-RaBitQ, and SymphonyQG have separate formats. SymphonyQG includes a versioned quantized format plus a legacy
 raw-format fallback; preserve both unless a breaking change is explicitly requested.
-
-### Change Python bindings
-
-Shared NumPy and string conversion helpers live in `python_bindings/bindings_common.hpp`. Register
-index-specific APIs in their own binding file and export public classes from
-`python_bindings/__init__.py`. Validate rank, dimensionality, state, and parameter ranges before
-entering the core. Be deliberate about `py::array::forcecast`: it permits dtype/layout copies and
-must not be used where callers expect in-place mutation or pointer identity.
-
-C-contiguous NumPy storage is not necessarily aligned even to `alignof(T)`.
-`ensure_2d_array` copies misaligned inputs into an aligned owner; one-dimensional
-ID conversion uses packed reads in `checked_cluster_ids` and `checked_removal_ids`
-before narrowing to owned PID storage. Reuse these helpers rather than directly
-dereferencing a possibly misaligned typed pointer. Removal IDs are checked against
-stored count, including removed records, rather than live count.
-
-Resolve filesystem-path conversion callbacks (`__fspath__`) before acquiring
-`IndexAccess` guards. Keep NumPy array conversion, including `__array__` callbacks,
-inside the guard's lifetime so concurrent conflicting operations are rejected during
-conversion. Acquire and destroy guards with the GIL held, release the GIL only inside
-their lifetime, and keep converted owners alive until reacquisition.
-
-Python wrappers use `IndexAccess` for concurrent reads and fail-fast exclusive updates.
-Extract native pointers before releasing the GIL and keep search parameters local to
-each call. C++ callers synchronize index mutations themselves.
-
-Keep `python_bindings/__init__.pyi` and runtime docstrings synchronized with public
-signatures, defaults and accepted inputs. For changes to Python API signatures,
-type declarations or accepted-input contracts,
-rebuild/install in the existing environment and run the
-[editor and type checks](../tests/README.md#python-editor-support):
-
-```bash
-python -m pytest tests/python/test_editor_support.py tests/test_mypy.py tests/test_pyright.py -q
-```
-
-These checks require the `test,typing` extras and Node 24 as described there.
-The mypy and Pyright tests live outside `tests/python` and are not selected by a
-plain `python -m pytest` run with the repository's default `testpaths`.
 
 ## Naming conventions
 
@@ -763,9 +693,6 @@ CMake exposes `rabitqlib::core`, `rabitqlib::fastscan` (depending on core) and
 are allowed. For core alone disable `RABITQ_BUILD_INDEX` and `RABITQ_BUILD_FASTSCAN`.
 Install only enabled components and their dependencies; core-only installs exclude
 FastScan/index/clustering and vendored hnswlib.
-Python is a MODULE extension with build-tree alias `rabitqlib::python` and import name
-`rabitqlib`, not a C++ link library or installed C++ component.
-
 The 0.7.0 refactor removed `rabitqlib::rabitqlib`, `defines.hpp`, `quantization/`,
 `utils/rotator.hpp` and generic `index/{query,lut,estimator}.hpp` forwarders. Migrate
 consumers to canonical `core/`, `fastscan/` and `index/{ivf,hnsw,symqg}/` headers;

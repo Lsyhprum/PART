@@ -58,7 +58,7 @@ if [[ -n "${CLANG_RESOURCE_DIR:-}" ]]; then
 fi
 for include_dir in "${system_include_dirs[@]}"; do
     # Append compiler defaults so dependency paths from the compilation database
-    # take precedence over system installations (for example, pybind11).
+    # take precedence over system installations.
     if [[ "$include_dir" == */lib/gcc/*/include ]]; then
         # Keep Clang's intrinsic headers ahead of GCC's, while still making
         # compiler-provided headers such as omp.h available.
@@ -82,7 +82,7 @@ for header in "${first_party_headers[@]}"; do
 done
 header_filter+=")$"
 
-source_filter="^$repo_root/(src|python_bindings|sample|tests)/"
+source_filter="^$repo_root/(src|sample|tests)/"
 
 # Use the runner's path normalization and filter before accepting a no-op run.
 "${PYTHON:-python3}" - "$build_dir/compile_commands.json" "$source_filter" <<'PYCODE'

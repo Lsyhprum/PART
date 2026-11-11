@@ -112,5 +112,5 @@ on your own dataset when choosing an index.
 ## Explore further
 
 - [Algorithm overview](rabitq/rabitq.md) for the rotation, encoding, and scoring workflow.
-- [RaBitQ Library 0.8.3 release notes](releases/0.8.3.md) for the latest changes and upgrade guidance.
+- [Release notes](releases/0.8.2.md) for the latest changes and upgrade guidance.
 - [Papers and citations](papers.md) for the original RaBitQ method, its multi-bit extension, and SymphonyQG.

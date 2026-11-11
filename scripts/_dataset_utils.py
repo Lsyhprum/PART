@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-_dataset_utils.py — 数据 IO 与 RoPE 旋转原语（自包含，仅依赖 numpy）。
+_dataset_utils.py -- data IO and RoPE rotation primitives (self-contained, only
+depends on numpy).
 
-从参考库 RaBitQ-range-inline-rot/_utils/_dataset_utils.py vendor 而来，
-去掉 faiss 依赖（get_nearestneighbors 未使用），保留 fvecs/ivecs/
-属性 bin 的读写与 disjoint-block RoPE 数值范围旋转原语。
+Vendored from RaBitQ-range-inline-rot/_utils/_dataset_utils.py, with the faiss
+dependency removed (the unused get_nearestneighbors) while keeping the fvecs/
+ivecs/attribute-bin read/write and the disjoint-block RoPE numeric-range
+rotation primitives.
 """
 import struct
 import numpy as np
@@ -46,20 +48,23 @@ def ibin_write(filename, data):
 
 
 def attr_bin_write(path, arr, dtype=np.uint32):
-    """带头自描述二进制写出：8 字节 [N, A]（int32 小端）+ N*A 个 dtype（行主序）。"""
+    """Write a self-describing binary with header: 8 bytes [N, A] (little-endian
+    int32) + N*A elements of dtype (row-major)."""
     data = np.ascontiguousarray(arr, dtype=dtype)
     n, A = data.shape
     with open(path, "wb") as fp:
-        fp.write(struct.pack("II", int(n), int(A)))   # 文件头
-        fp.write(data.tobytes(order="C"))            # 数据区
+        fp.write(struct.pack("II", int(n), int(A)))   # file header
+        fp.write(data.tobytes(order="C"))            # data section
 
 
 def attr_bin_read(path, dtype=np.uint32, n=None, a=None):
-    """属性 bin 读入并 reshape 为 (N, A)。
+    """Read an attribute bin and reshape to (N, A).
 
-    自适应两种格式（与 C++ load_attr_bin 一致）：
-      - 带头：前 8 字节 [N,A] int32 头 + 数据区（当 n/a 未提供时按头解析）；
-      - 无头：纯 N*A 数据区（当给定 n/a 时按文件大小自动判定有无头）。
+    Adapts to two formats (consistent with C++ load_attr_bin):
+      - with header: first 8 bytes [N,A] int32 header + data section (when n/a
+        are not provided, parse from the header);
+      - headerless: pure N*A data section (when n/a are given, auto-detect the
+        presence of a header from the file size).
     """
     import os
     if n is not None and a is not None:
@@ -78,11 +83,11 @@ def attr_bin_read(path, dtype=np.uint32, n=None, a=None):
             raise ValueError(
                 f"attr size mismatch {path}: {actual} not {expected_noheader} or {expected_header}")
         return arr.reshape(int(n), int(a)).copy()
-    # 无 n/a：强制按带头格式解析
-    raw = np.fromfile(path, dtype=np.int32)          # 头为 int32，便于取 N/A
+    # Without n/a: force parse in header format
+    raw = np.fromfile(path, dtype=np.int32)          # header is int32 for easy N/A
     n, A = int(raw[0]), int(raw[1])
     out = raw[2:].view(dtype).reshape(n, A).copy()
-    assert out.size == n * A, "属性文件数据区大小与头部 N*A 不一致"
+    assert out.size == n * A, "attribute file data section size != header N*A"
     return out
 
 
@@ -129,12 +134,12 @@ def ivecs_read(fname):
 
 
 #######################################################
-# Attribute rotation encoding (disjoint rotation)
+# Attribute CPR encoding (disjoint rotation)
 #######################################################
 
 def _rotated(x, angles):
-    """对 x 的每对相邻维度 (2j,2j+1) 施加角度 angles[:,j]。
-    x: (N,d) 或 (d,) float; angles: (N, d//2) 或 (1, d//2)。返回同形状 float32。"""
+    """Apply angle angles[:,j] to each adjacent dimension pair (2j,2j+1) of x.
+    x: (N,d) or (d,) float; angles: (N, d//2) or (1, d//2). Returns same-shape float32."""
     x = np.array(x, dtype=np.float64)
     single = x.ndim == 1
     if single:
@@ -153,25 +158,26 @@ def _rotated(x, angles):
     return out[0] if single else out
 
 
-def _hash_to_phases(ids, d, seed):
-    """把每个属性ID哈希为 (d//2) 个相位∈[0,2π)。相位只依赖于「值本身+seed」,
-    与数据集中其它值无关 -> 数据端与查询端对同一值必生成相同相位。"""
+def _hash_to_phases_cpr(ids, d, seed):
+    """Hash each attribute ID into (d//2) phases in [0,2pi). The phase depends
+    only on the value itself + seed, independent of other values in the dataset,
+    so the data side and the query side generate the same phase for the same value."""
     P = d // 2
     ids = np.asarray(ids, dtype=np.int64).reshape(-1)
     base_rng = np.random.default_rng(seed)
-    salt = base_rng.integers(0, 2 ** 31, size=P, dtype=np.int64)   # 每对维度一个盐
+    salt = base_rng.integers(0, 2 ** 31, size=P, dtype=np.int64)   # one salt per dimension pair
     out = np.empty((len(ids), P))
     for j in range(P):
         h = (ids * 2654435761) ^ (salt[j] * 40503)
         h = (h ^ (h >> 15)) & 0x7FFFFFFF
-        out[:, j] = (h / float(0x7FFFFFFF)) * 2.0 * np.pi         # ∈[0,2π)
+        out[:, j] = (h / float(0x7FFFFFFF)) * 2.0 * np.pi         # in [0,2pi)
     return out
 
 
-def block_split(A, P, scheme="contiguous"):
-    """把 P 个维度对均分给 A 个属性，互不重叠。
-    scheme='contiguous'：连续切分（默认，缓存/向量化友好）。
-    返回 list[length A]，每项为 block 维度对索引的 np.ndarray。"""
+def cpr_block_split(A, P, scheme="contiguous"):
+    """Split P dimension pairs evenly across A attributes with no overlap.
+    scheme='contiguous': contiguous split (default; cache/vectorization friendly).
+    Returns list[length A], each element a np.ndarray of block dimension-pair indices."""
     if scheme == "contiguous":
         base, rem = divmod(P, A)
         blocks, start = [], 0
@@ -183,30 +189,30 @@ def block_split(A, P, scheme="contiguous"):
     raise ValueError(f"unknown block scheme: {scheme}")
 
 
-def encode_disjoint(base, attrs_cat, blocks, seeds):
-    """disjoint-block 类别编码。返回 (N, d) float32。"""
+def encode_cpr(base, attrs_cat, blocks, seeds):
+    """disjoint-block categorical encoding. Returns (N, d) float32."""
     P = base.shape[1] // 2
     E = base.copy()
     for a in range(attrs_cat.shape[1]):
-        full = _hash_to_phases(attrs_cat[:, a], base.shape[1], seeds[a])   # (N, P)
+        full = _hash_to_phases_cpr(attrs_cat[:, a], base.shape[1], seeds[a])   # (N, P)
         ang = np.zeros((full.shape[0], P), dtype=np.float64)
         ang[:, blocks[a]] = full[:, blocks[a]]
         E = _rotated(E, ang)
     return E.astype(np.float32)
 
 
-# ----------------------------- (A) RoPE 频率编码 (数值范围) -----------------------------
+# ----------------------------- (A) RoPE frequency encoding (numeric range) -----------------------------
 
 def rope_angles(a_cont, d, base_freq=1.0):
-    """a_cont: (N,) 连续值∈[0,1); 返回 (N, d//2) 每对旋转角。"""
+    """a_cont: (N,) continuous value in [0,1); returns (N, d//2) per-pair rotation angle."""
     P = d // 2
     j = np.arange(P, dtype=np.float64)
     freq = np.pi * base_freq * (j + 1.0) / P          # (P,)
     return a_cont[:, None] * freq[None, :]              # (N, P)
 
 
-def rope_encode_disjoint(base, attrs_num, L, blocks, base_freq=1.0):
-    """disjoint-block 数值 RoPE 编码。attrs_num: (N, A) int∈[0,L)。"""
+def rope_encode_cpr(base, attrs_num, L, blocks, base_freq=1.0):
+    """disjoint-block numeric RoPE encoding. attrs_num: (N, A) int in [0,L)."""
     P = base.shape[1] // 2
     E = base.copy()
     for a in range(attrs_num.shape[1]):
@@ -218,8 +224,9 @@ def rope_encode_disjoint(base, attrs_num, L, blocks, base_freq=1.0):
     return E.astype(np.float32)
 
 
-def rope_query_range_disjoint(q, lo, hi, L, block, base_freq=1.0):
-    """disjoint 数值范围查询。仅对 block 维度对施加 RoPE 同相旋转。返回 (d,) float32。"""
+def rope_query_range_cpr(q, lo, hi, L, block, base_freq=1.0):
+    """disjoint numeric-range query. Apply only the same-phase RoPE rotation to
+    the block dimension pairs. Returns (d,) float32."""
     P = q.shape[0] // 2
     c = (lo + hi) / (2.0 * L)
     full = rope_angles(np.array([c], dtype=np.float64), q.shape[0], base_freq)[0]   # (P,) 1-D
@@ -229,10 +236,10 @@ def rope_query_range_disjoint(q, lo, hi, L, block, base_freq=1.0):
 
 
 #######################################################
-# Attribute FDM/CDMA encoding (ported from diskann-fdm)
+# Attribute APR encoding (ported from diskann-fdm)
 #######################################################
 
-# F0 修复：splitmix64 哈希 (GF(2) 非线性)
+# F0 fix: splitmix64 hash (GF(2) nonlinear)
 _MIX_C1 = np.uint64(0xBF58476D1CE4E5B9)
 _MIX_C2 = np.uint64(0x94D049BB133111EB)
 _GOLDEN_RATIO64 = np.uint64(0x9E3779B97F4A7C15)
@@ -247,10 +254,12 @@ def _mix64(x):
     return x ^ (x >> _U31)
 
 
-def _hash_to_phases_f0(ids, d, seed):
-    """把每个属性ID哈希为 (d//2) 个相位 in [0,2π)。F0 修复版（splitmix64 + 63-bit uint64 盐）。
+def _hash_to_phases_apr(ids, d, seed):
+    """Hash each attribute ID into (d//2) phases in [0,2pi). F0-fixed version
+    (splitmix64 + 63-bit uint64 salt).
 
-    独立于 rot 用的旧版 _hash_to_phases（线性哈希），避免改动 disjoint 编码行为。
+    Independent of the old _hash_to_phases_cpr (linear hash) used by cpr, to avoid
+    changing disjoint encoding behavior.
     """
     P = d // 2
     ids = np.asarray(ids, dtype=np.uint64).reshape(-1)
@@ -264,23 +273,26 @@ def _hash_to_phases_f0(ids, d, seed):
     return out
 
 
-def encode_fdm(base, attrs_cat, seeds):
-    """FDM/CDMA 布局：每个维度对同时承载全部 A 个属性的相位码。返回 (N, d) float32。
+def encode_apr(base, attrs_cat, seeds):
+    """APR layout: each dimension pair simultaneously carries the phase code
+    of all A attributes. Returns (N, d) float32.
 
-    total 旋转角(每对) = Σ_a ψ_a(v_a)[j]（数据端），查询端 = Σ_a ψ_a(t_a)[j]，
-    相对角 Δ[j] = Σ_a (ψ_a(t_a)-ψ_a(v_a))[j]。全匹配 Δ≡0 保距；任一失配被 P 对平均压到≈0。
+    total rotation angle (per pair) = sum_a psi_a(v_a)[j] (data side), query side
+    = sum_a psi_a(t_a)[j]; relative angle Delta[j] = sum_a (psi_a(t_a)-psi_a(v_a))[j].
+    Full match Delta==0 preserves distance; any mismatch is averaged over P pairs
+    and pressed to ~0.
     """
     P = base.shape[1] // 2
     total = np.zeros((attrs_cat.shape[0], P), dtype=np.float64)
     for a in range(attrs_cat.shape[1]):
-        total += _hash_to_phases_f0(attrs_cat[:, a], base.shape[1], seeds[a])
+        total += _hash_to_phases_apr(attrs_cat[:, a], base.shape[1], seeds[a])
     return _rotated(base, total).astype(np.float32)
 
 
-def query_fdm_single(q, targets, d, seeds):
+def query_apr_single(q, targets, d, seeds):
     P = d // 2
     q = np.asarray(q, dtype=np.float64)
     total = np.zeros((1, P), dtype=np.float64)
     for a in range(len(targets)):
-        total += _hash_to_phases_f0(np.array([int(targets[a])], dtype=np.int64), d, seeds[a])
+        total += _hash_to_phases_apr(np.array([int(targets[a])], dtype=np.int64), d, seeds[a])
     return _rotated(q, total).astype(np.float32)

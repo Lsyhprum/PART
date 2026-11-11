@@ -1,5 +1,5 @@
 site_name: RaBitQ Library
-site_description: Compact quantization and accurate vector search for C++ and Python
+site_description: Compact quantization and accurate vector search for C++
 site_url: https://vectordb-ntu.github.io/RaBitQ-Library/
 repo_url: https://github.com/VectorDB-NTU/RaBitQ-Library
 repo_name: VectorDB-NTU/RaBitQ-Library
@@ -9,13 +9,11 @@ copyright: Copyright &copy; VectorDB Group, Nanyang Technological University
 nav:
   - Home: index.md
   - Quick start: quick_start.md
-  - Migrating to 0.8: python_migration.md
   - Installation: installation.md
   - C++ Integration: cpp_integration.md
   # Group by minor version: nested groups stay collapsed except the current page's.
   - Release notes:
       - "0.8":
-          - "0.8.3": releases/0.8.3.md
           - "0.8.2": releases/0.8.2.md
           - "0.8.1": releases/0.8.1.md
           - "0.8.0": releases/0.8.0.md
@@ -30,7 +28,6 @@ nav:
       - Rotation: rabitq/rotator.md
       - Quantization: rabitq/quantizer.md
       - Stable core API: rabitq/core_api.md
-      - Python building blocks: rabitq/quant_python.md
       - Modular migration: modular_migration.md
       - Estimation: rabitq/estimator.md
       - Reranking: rabitq/reranking.md
@@ -106,6 +103,3 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/VectorDB-NTU/RaBitQ-Library
       name: RaBitQ Library on GitHub
-    - icon: fontawesome/brands/python
-      link: https://pypi.org/project/rabitqlib/
-      name: RaBitQ Library on PyPI

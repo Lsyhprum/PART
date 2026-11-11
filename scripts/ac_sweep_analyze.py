@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""解析 C-sweep 与 A-sweep 各配置的运行日志（[RESULT]/Indexing time/Predicate violations），
-插值得到 QPS@0.9recall，输出汇总表并写 JSON，供绘图脚本读取。
-仅读取日志，不改动任何库代码。"""
+"""Parse the run logs of each C-sweep and A-sweep configuration
+([RESULT] / Indexing time / Predicate violations), interpolate to obtain
+QPS@0.9 recall, print a summary table and write a JSON file for the plotting
+scripts to consume. This script only reads logs and never modifies any library
+code."""
 import re, json, os
 
-N = 999000  # base 规模 (openai1536)
+N = 999000  # base dataset size (openai1536)
 TARGET_RECALL = 0.9
-LOG_DIR = "/home/yq/SIGMOD2027/_log"
+LOG_DIR = "./_log"
 
 # (name, A, C, logfile)
 CONFIGS = [
@@ -69,7 +71,7 @@ def main():
             "name": name, "A": A, "C": C, "sel": sel, "gt": gt,
             "index_s": idx_t, "qps90": qps90, "maxrecall": max_r, "viol": viol,
         })
-    # 打印两表
+    # Print the two summary tables
     print(f"{'config':10} {'A':>3} {'C':>6} {'sel':>9} {'GT~':>8} {'Index(s)':>9} {'QPS@0.9':>9} {'maxRecall':>9} {'Viol':>5}")
     print("-" * 70)
     for sweep, label in [([r for r in results if r["A"] == 1 and r["C"] != 10], "C-sweep"),

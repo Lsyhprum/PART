@@ -13,33 +13,6 @@ reported performance should not be attributed to these configurations.
 
 ## Minimal workflow
 
-### Python
-
-Use `data` and `queries` from the [Quick start](../quick_start.md), or supply your
-own float32 arrays. SymphonyQG builds directly from vectors and needs no clustering
-step. The degree-32 example requires at least 33 data points.
-
-```python
-from rabitqlib import SymqgIndex
-
-# data and queries are float32 arrays with shape (count, dim).
-index = SymqgIndex(data.shape[1], max_degree=32, ef_construction=200, init="pipnn")
-ids = index.add(data)  # builds the whole graph; ids are the row numbers
-index.save("qg_example.index")
-
-loaded = SymqgIndex.load("qg_example.index")
-ids, distances = loaded.search(queries, k=10, ef=100)
-```
-
-SymphonyQG follows the same `train` → `add` → `search` workflow as the other
-indexes, but has nothing to train: `train(x)` only checks `x` as `add` would,
-and `is_trained` is always `True`. `add` builds the graph from every vector at once
-and can be called only once, as in Faiss's NSG index; a second call, or `add` on
-a loaded index, raises `RuntimeError`. To index more vectors, create a new index
-and add all of them. Point IDs are the row numbers of the added data. Files do
-not store the construction settings, so a loaded index reports
-`ef_construction`, `init` and `seed` as `None`.
-
 ### C++
 
 Link `rabitqlib::index`. Here `data` is a row-major `std::vector<float>` with

@@ -92,15 +92,10 @@ The CLI tools are produced under `build/bin/` (or `bin/` for an in-tree build):
 SymphonyQG / HNSW equivalents.
 
 Key CMake options: `RABITQ_BUILD_INDEX`, `RABITQ_BUILD_FASTSCAN`,
-`RABITQ_BUILD_SAMPLES`, `RABITQ_BUILD_TESTS`,
-`RABITQ_BUILD_PYTHON_BINDINGS`, and `RABITQ_USE_OPENMP` (required by the ANN
-indexes). `src/attribute/apr_rotation.cpp` is compiled with
+`RABITQ_BUILD_SAMPLES`, `RABITQ_BUILD_TESTS`, and `RABITQ_USE_OPENMP`
+(required by the ANN indexes). `src/attribute/apr_rotation.cpp` is compiled with
 `-ffp-contract=off -fno-fast-math` so its float32 output matches the NumPy
 reference protocol exactly.
-
-> Build environment note: if your shell wraps commands or injects `PYTHONPATH`
-> shims, build inside a clean environment (e.g. `env -i` with an explicit
-> `PATH`/`CC`/`CXX`) to avoid interference from unrelated tooling.
 
 ---
 
@@ -193,8 +188,8 @@ The encoder validates that the layout and the query stride are consistent.
 ## Datasets and reproduction
 
 **Unit / fixture tests** (self-contained, no external data) live under
-`tests/fixtures/attribute/` and are exercised by `ctest` and
-`tests/python/*`. They validate APR/HAPR against the NumPy reference protocol
+`tests/fixtures/attribute/` and are exercised by `ctest`. They validate
+APR/HAPR against the NumPy reference protocol
 (norm preservation, byte compatibility, and predicate-gate correctness for IVF
 and SymphonyQG indexes).
 
@@ -213,11 +208,7 @@ above.
 
 ```bash
 ctest --no-tests=error --test-dir build --output-on-failure   # C++ tests
-python -m pytest tests/python                                  # Python bindings tests
 ```
-
-The Python suite includes path-handling tests that deliberately use non-ASCII
-filenames, confirming the bindings accept international (e.g. UTF-8 / CJK) paths.
 
 <!-- ## Citation
 

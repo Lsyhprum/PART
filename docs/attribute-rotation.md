@@ -579,30 +579,3 @@ The filtered GT is reused unchanged because a full attribute match makes the
 rotation an isometry. The reference IVF baseline only wires up offline
 rotated fvecs and leaves its search sources untouched; the hard gate,
 oversampling and predicate statistics here follow PART's QG protocol instead.
-
-## Known limitations
-
-* **Reranking is CLI-only and L2-only.** Both `symqg_querying` and
-  `ivf_rabitq_querying` need external original vectors and reject IP indexes.
-  The library search APIs add predicate gates only, never reranking. With
-  `--rerank` candidates are ordered by original-space L2 while the range /
-  mixed GT is defined in the rotated domain, so choose a GT matching the
-  metric under evaluation.
-* **Oversampling stays within the probed clusters.** IVF enlarges `k`, not
-  `nprobe`, so reranking cannot recover matches in clusters that were never
-  scanned.
-* **HAPR is single-probe.** One interval produces exactly one probe at its
-  centre; the hard gate still enforces the full window. No M>1 sub-centre
-  strategy or `-1` wildcard support exists.
-* **Performance is deliberately unchanged.** Each gate decision costs `O(A)`
-  integer comparisons with no allocation; the APR kernel and the IVF scan
-  loops are not optimised in this round.
-
-## Future work
-
-1. Add a multi-probe wildcard strategy behind the reserved
-   `WildcardPolicy::kMultiProbe` value, and optionally M>1 range sub-centres.
-2. Make oversampling attribute-aware at routing time, for example by raising
-   `nprobe` together with `k` when predicate selectivity is low.
-3. Wire the `--layout` protocol into the Python bindings so
-   range / mixed predicates can be evaluated outside the C++ CLIs.

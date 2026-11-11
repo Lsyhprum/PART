@@ -23,10 +23,9 @@ Replace `rabitqlib::rabitqlib` with the smallest component needed:
 | `rabitqlib::core` | Encoding, single-vector estimation, rotation and packing | Numerical helpers and essential SIMD |
 | `rabitqlib::fastscan` | Batch layouts, packing/encoding adapters and FastScan/HACC scoring | core |
 | `rabitqlib::index` | IVF-RaBitQ, HNSW-RaBitQ, SymphonyQG and clustering | fastscan and core |
-| `rabitqlib::python` | Existing Python ANN extension; build-tree alias only | index |
 
 The old implementation target `rabitq_headers` is also removed. C++ libraries remain
-static. Python still uses `import rabitqlib`; it is not an exported C++ package component.
+static; the Python extension was never an exported C++ package component.
 
 For a numerical library without ANN or OpenMP:
 
@@ -175,7 +174,7 @@ ID bounds, append offsets, and minimum resize capacity. Use `num_points` for a
 live count, without subtracting a separate deletion counter.
 
 The IVF-RaBitQ constructor keyword `max_elements` still specifies the required initial
-build size; 0.8 deprecates it (see [Migrating to 0.8](python_migration.md)). SymphonyQG's C++ `num_vertices()` still returns the configured graph
+build size; 0.8 deprecates it. SymphonyQG's C++ `num_vertices()` still returns the configured graph
 size for builders. Existing index files need no conversion: loading recovers
 counts from their removal markers.
 

@@ -110,8 +110,8 @@ foreach(component IN LISTS components)
                     "-DCOMPILE_COMMANDS=${work}/${build}/compile_commands.json"
                     -P "${CMAKE_CURRENT_LIST_DIR}/check_no_openmp.cmake")
             endif()
-            if(commands MATCHES "src/index/|python_bindings/|clustering/")
-                message(FATAL_ERROR "ANN/Python source compiled by ${component}/${build}")
+            if(commands MATCHES "src/index/|clustering/")
+                message(FATAL_ERROR "ANN source compiled by ${component}/${build}")
             endif()
             if(component STREQUAL "core" AND commands MATCHES "src/fastscan/|src/simd/(fastscan|estimator)_")
                 message(FATAL_ERROR "FastScan source compiled by core/${build}")
@@ -124,15 +124,6 @@ endforeach()
 if(NOT "core" IN_LIST components)
     message(STATUS "FastScan external consumers passed")
     return()
-endif()
-
-# Configuration must fail early for combinations that cannot provide full functionality.
-execute_process(COMMAND "${CMAKE_COMMAND}" -S "${RABITQ_SOURCE_DIR}"
-    -B "${WORK_DIR}/invalid-python" -DRABITQ_BUILD_INDEX=OFF
-    -DRABITQ_BUILD_PYTHON_BINDINGS=ON RESULT_VARIABLE result
-    OUTPUT_VARIABLE output ERROR_VARIABLE error)
-if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "requires RABITQ_BUILD_INDEX=ON")
-    message(FATAL_ERROR "Core-only Python configuration was not rejected clearly")
 endif()
 
 file(MAKE_DIRECTORY "${WORK_DIR}/require-index")

@@ -18,7 +18,8 @@ inline void parallel_for(
     size_t start,
     size_t end,
     size_t num_threads,
-    Function fn
+    Function fn,
+    bool reuse_workers = false
 ) {
     if (start >= end) {
         return;

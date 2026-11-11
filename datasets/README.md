@@ -3,13 +3,13 @@
 This folder holds the **batch attribute-dataset generation** toolkit used to produce
 the filtered-search datasets and ground-truth (gt) files for the PART paper
 experiments. It covers three attribute-filter types: equality, range, and mixed
-(one equality + one range, two-condition AND).
+(equality + range).
 
-| Workflow | Entry point | Purpose |
-|---|---|---|
-| A. Equality attribute (attribute + filtered gt + queries.json) | `run_gen_eq_attr_gt.sh` | 7 datasets × 4 selectivities, C++ multi-threaded acceleration |
-| B. Range attribute (query predicate is a `[lo,hi]` interval) | `run_gen_range_attr_gt.sh` | 3 datasets × 4 selectivities |
-| C. Mixed attribute (1 equality + 1 range, two-condition AND) | `run_gen_mix_attr_gt.sh` | default sel=1% (C_eq=10 × C_range=100, w=10) |
+| Workflow | Entry point |
+|---|---|
+| A. Equality attribute (attribute + filtered gt + queries.json) | `run_gen_eq_attr_gt.sh` |
+| B. Range attribute (query predicate is a `[lo,hi]` interval) | `run_gen_range_attr_gt.sh` |
+| C. Mixed attribute (1 equality + 1 range, two-condition AND) | `run_gen_mix_attr_gt.sh` |
 
 ---
 

@@ -1,47 +1,47 @@
 #!/usr/bin/env bash
 # ============================================================
-# run.sh — 读取 config.cfg，执行 RaBitQ-Library-inline-rot (symqg) baseline 全流程：
+# run.sh — reads config.cfg and runs the full RaBitQ-Library-inline-rot (symqg) baseline pipeline:
 #   prepare -> build -> index -> search
-# 增强臂需额外先运行 encode_range 阶段（生成 range bin / range GT / 旋转数据集）。
+# The enhanced branch additionally runs the encode_range stage first (produces range bin / range GT / rotated dataset).
 #
-# 约定对齐 SIGMOD2027/baseline 下 RaBitQ-Library-post / RaBitQ-inline / NHQ / ACORN：
-#   - 解析 config.cfg（仅加载 KEY=VALUE 行，跳过注释/空行，去两端空白与引号）
-#   - 相对路径锚定到 SCRIPT_DIR（本配置均为绝对路径，原样保留）
-#   - 由 ATTR_DIM/ATTR_CARD 派生命名（base_attr_A*_C*.bin 等）
-#   - 线程/库路径注入（调度层控制，不改算法源码）
-#   - 统一 LOG_DIR 日志（每次 search 前清空历史 [RESULT] 行）
+# Conventions aligned with SIGMOD2027/baseline's RaBitQ-Library-post / RaBitQ-inline / NHQ / ACORN:
+#   - parse config.cfg (only load KEY=VALUE lines; skip comments/blank lines; trim surrounding whitespace and quotes)
+#   - resolve relative paths against SCRIPT_DIR (all paths here are absolute and kept as-is)
+#   - derive names from ATTR_DIM/ATTR_CARD (e.g. base_attr_A*_C*.bin)
+#   - inject thread/library paths (controlled by the scheduler layer; algorithm sources are untouched)
+#   - unified LOG_DIR logging (clears previous [RESULT] lines before each search)
 #
-# 四种检索模式（由 config 自动选择）：
-#   pure           : ATTR_BASE/ATTR_QUERY 均置空
-#   inline         : ATTR_BASE/ATTR_QUERY 均非空 且 ATTR_RANGE=0  （图内等值过滤）
-#   range_hardgate : ATTR_BASE/ATTR_QUERY 均非空 且 ATTR_RANGE=1  （-r 内核硬闸门）
-#   enhanced       : RANGE_QUERY=on  （RoPE 旋转 + M 子中心并集 + 原始空间重排闸门）
+# Four retrieval modes (auto-selected from config):
+#   pure           : both ATTR_BASE/ATTR_QUERY empty
+#   inline         : both ATTR_BASE/ATTR_QUERY non-empty and ATTR_RANGE=0  (in-graph equality filtering)
+#   range_hardgate : both ATTR_BASE/ATTR_QUERY non-empty and ATTR_RANGE=1  (-r kernel hard gate)
+#   enhanced       : RANGE_QUERY=on  (RoPE rotation + M-subcenter union + original-space rerank gate)
 #
-# 用法：
-#   bash run.sh                        # prepare -> build -> index -> search（按当前 config 模式）
-#   bash run.sh prepare                # 仅软链数据（向量/真值/属性 -> DATA_SOURCE）
-#   bash run.sh build                  # 仅 cmake 编译 symqg_indexing / symqg_querying
-#   bash run.sh index                  # 仅构建 symqg 图索引（已存在则跳过，除非 -f）
-#   bash run.sh encode_range           # 仅生成 range bin/GT 与（enhanced 时）旋转数据集
-#   bash run.sh search                 # 仅检索并输出 [RESULT] 日志
-#   bash run.sh -f                     # 强制重建索引（即使索引文件已存在）
-#   也可组合：bash run.sh prepare build index encode_range search
+# Usage:
+#   bash run.sh                        # prepare -> build -> index -> search (per current config mode)
+#   bash run.sh prepare                # only symlink data (vectors/GT/attributes -> DATA_SOURCE)
+#   bash run.sh build                  # only cmake-build symqg_indexing / symqg_querying
+#   bash run.sh index                  # only build the symqg graph index (skip if exists unless -f)
+#   bash run.sh encode_range           # only produce range bin/GT and (for enhanced) the rotated dataset
+#   bash run.sh search                 # only run search and emit [RESULT] logs
+#   bash run.sh -f                     # force index rebuild (even if the index file already exists)
+#   also combinable: bash run.sh prepare build index encode_range search
 # ============================================================
 set -euo pipefail
 
-# ---- 定位脚本所在目录（保证从任意位置调用都正确）----
+# ---- Locate the directory containing this script (works from any invocation path) ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.cfg"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "[error] 找不到配置文件: $CONFIG_FILE" >&2
+  echo "[error] config file not found: $CONFIG_FILE" >&2
   exit 1
 fi
 
-# ---- 环境变量覆盖层（sweep 批量驱动用）----
-# 注意：必须在读取 config 之前先快照环境变量覆盖值——否则 config 的 declare -g 会把
-# 环境值覆盖掉，导致后续 ${!_k} 读到的是 config 值而非 export 值。
-# 模式开关（ATTR_BASE/ATTR_QUERY/ATTR_RANGE/RANGE_QUERY 等）不在此列，以保证 inline 固定。
+# ---- Environment-variable override layer (used by sweep batch drivers) ----
+# Note: the env-var overrides must be snapshotted BEFORE reading config.cfg — otherwise config's
+# declare -g would overwrite the env values, so later ${!_k} would read the config value instead of the export.
+# Mode switches (ATTR_BASE/ATTR_QUERY/ATTR_RANGE/RANGE_QUERY, etc.) are excluded here, to keep inline fixed.
 OVERRIDE_KEYS=(DATASET D N NQ K \
                ATTR_DIM ATTR_CARD \
                VEC_BASE VEC_QUERY ORIG_DATASET_DIR ORIG_DATASET \
@@ -56,7 +56,7 @@ for _k in "${OVERRIDE_KEYS[@]}"; do
   fi
 done
 
-# ---- 读取配置（仅加载 KEY=VALUE 行，跳过注释/空行，去两端空白与引号）----
+# ---- Read config (only load KEY=VALUE lines; skip comments/blank lines; trim whitespace and quotes) ----
 while IFS='=' read -r key value; do
   key="$(echo "$key" | xargs)"
   value="$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')"
@@ -65,18 +65,18 @@ while IFS='=' read -r key value; do
   declare -g "$key=$value"
 done < "$CONFIG_FILE"
 
-# ---- 应用环境变量覆盖（sweep 批量驱动用；不影响单跑）----
-# 覆盖值来自读取 config 前快照的环境变量（见上方 _ENV_OVERRIDE）。
+# ---- Apply environment-variable overrides (used by sweep batch drivers; no effect on single runs) ----
+# The override values come from env vars snapshotted before reading config (see _ENV_OVERRIDE above).
 for _k in "${OVERRIDE_KEYS[@]}"; do
   _e="${_ENV_OVERRIDE[$_k]:-}"
   if [[ -n "$_e" ]]; then
     declare -g "$_k=$_e"
   fi
 done
-# ORIG_DATASET 默认与 DATASET 同源（prepare 后 DATA_SOURCE 下文件名 stem 一致）
+# ORIG_DATASET defaults to the same source as DATASET (after prepare, filenames under DATA_SOURCE share the same stem)
 ORIG_DATASET="${ORIG_DATASET:-$DATASET}"
 
-# ---- 将可能相对的路径锚定到脚本所在目录 SCRIPT_DIR ----
+# ---- Anchor possibly-relative paths to SCRIPT_DIR ----
 for _p in DATA_SOURCE INDEX_DIR RABITQLIB_HOME LOG_DIR VEC_BASE VEC_QUERY ORIG_DATASET_DIR; do
   _v="${!_p}"
   case "$_v" in
@@ -86,53 +86,53 @@ for _p in DATA_SOURCE INDEX_DIR RABITQLIB_HOME LOG_DIR VEC_BASE VEC_QUERY ORIG_D
   declare -g "$_p=$_v"
 done
 
-# ---- 校验必要参数（ATTR_BASE/ATTR_QUERY/ATTR_RANGE/RANGE_QUERY 为可选开关，不强制）----
+# ---- Validate required parameters (ATTR_BASE/ATTR_QUERY/ATTR_RANGE/RANGE_QUERY are optional switches, not enforced) ----
 for v in DATA_SOURCE DATASET RABITQLIB_HOME INDEX_DIR VEC_BASE VEC_QUERY ORIG_DATASET_DIR ORIG_DATASET \
          D N NQ K MAX_DEGREE EF_CONSTRUCTION METRIC QUANTIZATION_BITS INIT EF_SEARCH ROUNDS \
          BUILD_THREADS SEARCH_THREADS GT_SUFFIX ATTR_DIM ATTR_CARD \
          RANGE_M RANGE_DATASET RANGE_L RANGE_W LOG_DIR PY; do
   if [[ -z "${!v:-}" ]]; then
-    echo "[error] 配置缺失: $v" >&2
+    echo "[error] missing config key: $v" >&2
     exit 1
   fi
 done
 
-# ---- 派生文件路径（命名规则对齐 SIGMOD2027 约定）----
+# ---- Derive file paths (naming conventions aligned with SIGMOD2027) ----
 ATTR_SUFFIX="_A${ATTR_DIM}_C${ATTR_CARD}"
 DATA_DIR="$DATA_SOURCE"
 BASE_FVECS="$DATA_DIR/${DATASET}_base.fvecs"
 QUERY_FVECS="$DATA_DIR/${DATASET}_query.fvecs"
-GT_PURE="$DATA_DIR/${DATASET}${GT_SUFFIX}"                                   # 无过滤真值
-GT_INLINE="$DATA_DIR/${DATASET}_groundtruth${ATTR_SUFFIX}.ivecs"             # 等值过滤真值
-GT_RANGE="$DATA_DIR/${DATASET}_groundtruth_range${ATTR_SUFFIX}.ivecs"        # 范围过滤真值
+GT_PURE="$DATA_DIR/${DATASET}${GT_SUFFIX}"                                   # groundtruth without filtering
+GT_INLINE="$DATA_DIR/${DATASET}_groundtruth${ATTR_SUFFIX}.ivecs"             # groundtruth for equality filtering
+GT_RANGE="$DATA_DIR/${DATASET}_groundtruth_range${ATTR_SUFFIX}.ivecs"        # groundtruth for range filtering
 BASE_ATTR="$DATA_DIR/base_attr${ATTR_SUFFIX}.bin"
 QUERY_ATTR="$DATA_DIR/query_attr${ATTR_SUFFIX}.bin"
-RANGE_BIN="$DATA_DIR/query_attr${ATTR_SUFFIX}_range.bin"                     # 范围谓词 bin (2A 列)
+RANGE_BIN="$DATA_DIR/query_attr${ATTR_SUFFIX}_range.bin"                     # range-predicate bin (2A columns)
 
-# 原始 base/query：精确重排用（旋转保距，原始空间距离==GT 口径，对齐 IVF 阶段2）。
-# 注意：索引与遍历在（属性旋转后的）BASE_FVECS 上进行；精确重排用原始向量，二者数值等价。
+# Original base/query: used for exact reranking (rotation preserves distances, so original-space distance == GT metric, aligned with IVF stage 2).
+# Note: indexing and traversal operate on (attribute-rotated) BASE_FVECS; exact reranking uses the original vectors — the two are numerically equivalent.
 EXACT_BASE="$DATA_DIR/${DATASET}_base.fvecs"
 EXACT_QUERY="$DATA_DIR/${DATASET}_query.fvecs"
 
-# 属性旋转 base/query（对齐 IVF encode_disjoint；正交旋转保距，原始空间 GT 仍有效）。
-# inline 索引与遍历用旋转向量；旋转依赖 A/C，故按 ac 隔离目录。
-FDM_ROOT="${FDM_ROOT:-$DATA_DIR}"
-FDM_DIR="$FDM_ROOT/fdm_rotated${ATTR_SUFFIX}"
-FDM_BASE="$FDM_DIR/${DATASET}_base.fvecs"
-FDM_QUERY="$FDM_DIR/${DATASET}_query.fvecs"
+# Attribute-rotated base/query (aligned with the IVF attribute rotation; orthogonal rotation preserves distances, so original-space GT stays valid).
+# Inline indexing/traversal uses the rotated vectors; rotation depends on A/C, so outputs are isolated per (A,C) in their own directory.
+APR_ROOT="${APR_ROOT:-$DATA_DIR}"
+APR_DIR="$APR_ROOT/apr_rotated${ATTR_SUFFIX}"
+APR_BASE="$APR_DIR/${DATASET}_base.fvecs"
+APR_QUERY="$APR_DIR/${DATASET}_query.fvecs"
 
 BUILD_DIR="$RABITQLIB_HOME/build"
 BIN_DIR="$RABITQLIB_HOME/bin"
 INDEX_BIN="$BIN_DIR/symqg_indexing"
 QUERY_BIN="$BIN_DIR/symqg_querying"
 
-# ---- 行间过滤开关：ATTR_BASE 与 ATTR_QUERY 均非空即启用 ----
+# ---- Row-wise filter switch: enabled when both ATTR_BASE and ATTR_QUERY are non-empty ----
 USE_INLINE=0
 if [[ -n "${ATTR_BASE:-}" && -n "${ATTR_QUERY:-}" ]]; then
   USE_INLINE=1
 fi
 
-# ---- 模式判定（增强臂 / -r 硬闸门 baseline / 等值 inline / 纯向量）----
+# ---- Mode selection (enhanced branch / -r hard-gate baseline / equality inline / pure vector) ----
 MODE="pure"
 if [[ "${RANGE_QUERY:-}" == "on" ]]; then
   MODE="enhanced"
@@ -142,16 +142,16 @@ elif [[ "$USE_INLINE" == 1 ]]; then
   MODE="inline"
 fi
 
-# ---- 重排臂开关（仅 inline 模式生效：1=用原始向量重排，0=关闭，用于量化噪声对照）----
+# ---- Rerank switch (only effective in inline mode: 1=rerank with original vectors, 0=off, used for quantization-noise comparison) ----
 RERANK="${RERANK:-1}"
 
-# ---- 量化比特后缀：bit=0 不追加；bit>0 追加 _bN，隔离索引/日志，bit=0/1 互不干扰 ----
+# ---- Quantization-bit suffix: bit=0 appends nothing; bit>0 appends _bN, isolating index/log; bit=0/1 do not interfere ----
 BITS_SUFFIX=""
 if [[ -n "${QUANTIZATION_BITS:-}" && "${QUANTIZATION_BITS:-0}" != "0" ]]; then
   BITS_SUFFIX="_b${QUANTIZATION_BITS}"
 fi
 
-# ---- 各模式依赖的 dataset / 索引 / 真值 / 属性 / 日志 ----
+# ---- Per-mode dataset / index / groundtruth / attribute / log dependencies ----
 case "$MODE" in
   enhanced)
     EFF_DATASET="$RANGE_DATASET"
@@ -169,10 +169,10 @@ case "$MODE" in
     ;;
   inline)
     EFF_DATASET="$DATASET"
-    INDEX_DIR="${INDEX_DIR}${ATTR_SUFFIX}${BITS_SUFFIX}"   # 按 ac 隔离（旋转 base 依赖 A/C）
+    INDEX_DIR="${INDEX_DIR}${ATTR_SUFFIX}${BITS_SUFFIX}"   # isolated per (A,C) (rotated base depends on A/C)
     INDEX_FILE="$INDEX_DIR/${EFF_DATASET}_symqg_M${MAX_DEGREE}.index"
-    BASE_FVECS="$FDM_BASE"          # 索引/遍历用属性 FDM 旋转 base
-    QUERY_FVECS="$FDM_QUERY"        # 检索 query 用属性 FDM 旋转 query
+    BASE_FVECS="$APR_BASE"          # index/traversal uses the attribute-APR rotated base
+    QUERY_FVECS="$APR_QUERY"        # search query uses the attribute-APR rotated query
     SEARCH_QUERY="$QUERY_FVECS"
     GT_FILE="$GT_INLINE"
     rk_suf=""
@@ -197,11 +197,11 @@ echo "[info] search: EF_SEARCH=$EF_SEARCH ROUNDS=$ROUNDS"
 echo "[info] BUILD_THREADS=$BUILD_THREADS  SEARCH_THREADS=$SEARCH_THREADS"
 echo "[info] LOG_FILE=$LOG_FILE"
 
-# ---- 线程 affinity（调度层控制，不改算法源码）----
+# ---- Thread affinity (scheduler-layer control; algorithm sources untouched) ----
 BUILD_AFFINITY="0-$((BUILD_THREADS-1))"
 SEARCH_AFFINITY="0-$((SEARCH_THREADS-1))"
 
-# ---- 解析 -f（强制重建索引）与阶段列表 ----
+# ---- Parse -f (force index rebuild) and the stage list ----
 FORCE_REBUILD=0
 STAGES=()
 for a in "$@"; do
@@ -216,7 +216,7 @@ if [[ ${#STAGES[@]} -eq 0 ]]; then
 fi
 
 # =====================================================================
-# 阶段 1：prepare —— 调用 data/prepare.py 软链 msmarco 数据到 DATA_SOURCE
+# Stage 1: prepare — invoke data/prepare.py to symlink msmarco data into DATA_SOURCE
 # =====================================================================
 run_prepare() {
   echo "========== [1/4] prepare =========="
@@ -233,7 +233,7 @@ run_prepare() {
 }
 
 # =====================================================================
-# 阶段 2：build —— out-of-source cmake + 编译 symqg_indexing / symqg_querying
+# Stage 2: build — out-of-source cmake + compile symqg_indexing / symqg_querying
 # =====================================================================
 run_build() {
   echo "========== [2/4] build (symqg) =========="
@@ -242,50 +242,49 @@ run_build() {
     -DCMAKE_BUILD_TYPE=Release \
     -DRABITQ_BUILD_SAMPLES=ON \
     -DRABITQ_BUILD_TESTS=OFF \
-    -DRABITQ_BUILD_PYTHON_BINDINGS=OFF \
     -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=ON
   echo "[build] cmake configured."
   bash /home/yq/clean-env.sh taskset -c "$BUILD_AFFINITY" cmake --build "$BUILD_DIR" \
     --target symqg_indexing symqg_querying --parallel "$BUILD_THREADS"
   if [[ ! -x "$INDEX_BIN" || ! -x "$QUERY_BIN" ]]; then
-    echo "[error] 编译后未找到 $INDEX_BIN 或 $QUERY_BIN" >&2
+    echo "[error] binaries not found after build: $INDEX_BIN or $QUERY_BIN" >&2
     exit 1
   fi
   echo "[build] done. binaries: $INDEX_BIN $QUERY_BIN"
 }
 
 # =====================================================================
-# 阶段 3：index —— 运行 symqg_indexing 构建对称量化图索引
-#   增强臂在旋转数据集（RANGE_DATASET）上建图，其余在原 DATASET 上建图。
-#   参数: data.fvecs degree ef index_file [metric] [quant_bits] [init] [threads]
+# Stage 3: index — run symqg_indexing to build the symmetric-quantization graph index
+#   The enhanced branch builds the graph on the rotated dataset (RANGE_DATASET); others on the original DATASET.
+#   args: data.fvecs degree ef index_file [metric] [quant_bits] [init] [threads]
 # =====================================================================
 run_index() {
   echo "========== [3/4] index (symqg_indexing) =========="
-  run_encode   # inline 模式生成属性旋转 base（幂等）
-  [[ -x "$INDEX_BIN" ]] || { echo "[error] 找不到 $INDEX_BIN，请先运行 build" >&2; exit 1; }
-  [[ -f "$BASE_FVECS" ]] || { echo "[error] 找不到 $BASE_FVECS，请先运行 prepare" >&2; exit 1; }
+  run_encode   # inline mode: produce the attribute-rotated base (idempotent)
+  [[ -x "$INDEX_BIN" ]] || { echo "[error] $INDEX_BIN not found, run build first" >&2; exit 1; }
+  [[ -f "$BASE_FVECS" ]] || { echo "[error] $BASE_FVECS not found, run prepare first" >&2; exit 1; }
   if [[ -f "$INDEX_FILE" && "$FORCE_REBUILD" -eq 0 ]]; then
-    echo "[index] 索引已存在，跳过构建（使用 -f 强制重建）: $INDEX_FILE"
+    echo "[index] index exists, skip build (use -f to force rebuild): $INDEX_FILE"
   else
     if [[ "$FORCE_REBUILD" -eq 1 && -f "$INDEX_FILE" ]]; then
-      echo "[index] -f 指定，重新构建索引"
+      echo "[index] -f given, rebuilding index"
     fi
     mkdir -p "$INDEX_DIR"
     bash /home/yq/clean-env.sh taskset -c "$BUILD_AFFINITY" "$INDEX_BIN" \
       "$BASE_FVECS" "$MAX_DEGREE" "$EF_CONSTRUCTION" "$INDEX_FILE" \
       "$METRIC" "$QUANTIZATION_BITS" "$INIT" "$BUILD_THREADS"
-    echo "[index] 构建完成 -> $INDEX_FILE"
+    echo "[index] build complete -> $INDEX_FILE"
   fi
 }
 
 # =====================================================================
-# 阶段 2b：encode_range —— 生成范围谓词 bin + 范围 GT（+ 增强臂旋转数据集）
-#   range_dataset.py 始终运行（range_hardgate / enhanced 都依赖其产物）；
-#   encode_dataset_range.py 仅在增强臂（RANGE_QUERY=on）时运行（生成旋转 base/query）。
+# Stage 2b: encode_range — produce the range-predicate bin + range GT (+ rotated dataset for the enhanced branch)
+#   range_dataset.py always runs (both range_hardgate and enhanced depend on its outputs);
+#   encode_dataset_range.py runs only for the enhanced branch (RANGE_QUERY=on) to produce rotated base/query.
 # =====================================================================
 run_encode_range() {
   echo "========== [2b] encode_range =========="
-  # 1) 生成范围谓词 bin（Nq x 2A）与范围 GT（复用现有 base_attr 作为真值）
+  # 1) produce the range-predicate bin (Nq x 2A) and the range GT (reuse the existing base_attr as groundtruth)
   echo "---- [2b.1] range_dataset.py : range bin + range GT ----"
   bash /home/yq/clean-env.sh "$PY" "$RABITQLIB_HOME/scripts/range_dataset.py" \
       --src-base "$DATA_DIR/${ORIG_DATASET}_base.fvecs" \
@@ -296,7 +295,7 @@ run_encode_range() {
       --groundtruth-name "${ORIG_DATASET}_groundtruth_range${ATTR_SUFFIX}.ivecs" \
       --A "$ATTR_DIM" --card "$ATTR_CARD" --range-w "${RANGE_W:-5}" \
       --K "$K" --n "$N" --nq "$NQ" --d "$D" --metric l2
-  # 2) 增强臂：生成旋转数据集（base 旋转 + query M 子中心）
+  # 2) enhanced branch: produce the rotated dataset (rotated base + query M-subcenters)
   if [[ "$MODE" == "enhanced" ]]; then
     echo "---- [2b.2] encode_dataset_range.py : rotated base + M-subcenter query ----"
     bash /home/yq/clean-env.sh "$PY" "$RABITQLIB_HOME/scripts/encode_dataset_range.py" \
@@ -309,53 +308,55 @@ run_encode_range() {
         --rotated-base-name "${RANGE_DATASET}_base.fvecs" \
         --rotated-query-name "${RANGE_DATASET}_query.fvecs"
   else
-    echo "[encode_range] 非增强臂模式，跳过旋转数据集生成（仅生成 range bin / range GT）。"
+    echo "[encode_range] non-enhanced mode, skip rotated dataset generation (only range bin / range GT produced)."
   fi
   echo "[encode_range] done."
 }
 
 # =====================================================================
-# 阶段 2c：encode（属性 FDM 旋转 base/query，移植自 diskann-fdm）
-#   仅 inline 模式需要：对原始 base/query 施加 FDM/CDMA 相位叠加编码
-#   （encode_fdm，每维对承载全部 A 属性相位码），产出 FDM 旋转向量供索引与遍历。
-#   旋转保距，故原始空间 GT 与精确重排仍有效；产物按 ac 隔离。幂等。
+# Stage 2c: encode — apply attribute-APR rotation to base/query (ported from diskann-fdm)
+#   Only needed for inline mode: apply APR/CDMA phase-superposition encoding to the original base/query
+#   (encode_apr, each dimension pair carries the phase code of all A attributes), producing APR-rotated
+#   vectors for indexing and traversal.
+#   Rotation preserves distances, so the original-space GT and exact reranking stay valid; outputs are
+#   isolated per (A,C). Idempotent.
 # =====================================================================
 run_encode() {
   if [[ "$MODE" != "inline" ]]; then
     return 0
   fi
-  if [[ -f "$FDM_BASE" && -f "$FDM_QUERY" ]]; then
-    echo "[encode] FDM base/query 已存在，跳过: $FDM_DIR"
+  if [[ -f "$APR_BASE" && -f "$APR_QUERY" ]]; then
+    echo "[encode] APR base/query already exist, skip: $APR_DIR"
     return 0
   fi
-  mkdir -p "$FDM_DIR"
+  mkdir -p "$APR_DIR"
   local IVE_UTILS="$SCRIPT_DIR/scripts"
-  echo "========== [2c] encode (属性 FDM 旋转 base/query) =========="
-  echo "[encode] A=$ATTR_DIM C=$ATTR_CARD seed=1234 -> $FDM_DIR"
-  PYTHONPATH="$IVE_UTILS:${PYTHONPATH:-}" "$PY" "$SCRIPT_DIR/scripts/encode_attr_fdm.py" \
-      --ds "$DATA_DIR" --out "$FDM_DIR" \
+  echo "========== [2c] encode (attribute-APR rotated base/query) =========="
+  echo "[encode] A=$ATTR_DIM C=$ATTR_CARD seed=1234 -> $APR_DIR"
+  PYTHONPATH="$IVE_UTILS:${PYTHONPATH:-}" "$PY" "$SCRIPT_DIR/scripts/encode_attr_apr.py" \
+      --ds "$DATA_DIR" --out "$APR_DIR" \
       --d "$D" --A "$ATTR_DIM" --enc-seed 1234 \
       --base-name "${DATASET}_base.fvecs" \
       --query-name "${DATASET}_query.fvecs" \
       --base-attr-name "base_attr${ATTR_SUFFIX}.bin" \
       --query-attr-name "query_attr${ATTR_SUFFIX}.bin" \
       --groundtruth-name "${DATASET}_groundtruth${ATTR_SUFFIX}.ivecs" \
-      --fdm-base-name "${DATASET}_base.fvecs" \
-      --fdm-query-name "${DATASET}_query.fvecs"
-  echo "[encode] done -> $FDM_BASE"
+      --apr-base-name "${DATASET}_base.fvecs" \
+      --apr-query-name "${DATASET}_query.fvecs"
+  echo "[encode] done -> $APR_BASE"
 }
 
 # =====================================================================
-# 阶段 4：search —— 运行 symqg_querying 扫描 ef，输出 [RESULT] 日志
-#   参数: index query.fvecs gt.ivecs [topk] [efs_csv] [algo] [rounds] [threads]
+# Stage 4: search — run symqg_querying scanning ef, emit [RESULT] logs
+#   args: index query.fvecs gt.ivecs [topk] [efs_csv] [algo] [rounds] [threads]
 #         [-b base_attr -a query_attr -A attr_dim -r]
 #         [--range_m M --orig_base base.fvecs --orig_query query.fvecs]
 # =====================================================================
 run_search() {
   echo "========== [4/4] search (symqg_querying) =========="
-  run_encode   # inline 模式确保属性旋转 query 存在（幂等）
-  [[ -x "$QUERY_BIN" ]] || { echo "[error] 找不到 $QUERY_BIN，请先运行 build" >&2; exit 1; }
-  [[ -f "$INDEX_FILE" ]] || { echo "[error] 找不到索引 $INDEX_FILE，请先运行 index" >&2; exit 1; }
+  run_encode   # inline mode: ensure attribute-rotated query exists (idempotent)
+  [[ -x "$QUERY_BIN" ]] || { echo "[error] $QUERY_BIN not found, run build first" >&2; exit 1; }
+  [[ -f "$INDEX_FILE" ]] || { echo "[error] index $INDEX_FILE not found, run index first" >&2; exit 1; }
 
   local attr_args=()
   local extra_args=()
@@ -363,32 +364,32 @@ run_search() {
     enhanced)
       attr_args=(-b "$BASE_ATTR" -a "$RANGE_BIN" -A "$ATTR_DIM")
       extra_args=(--range_m "${RANGE_M:-1}" --orig_base "$BASE_FVECS" --orig_query "$QUERY_FVECS")
-      echo "[search] 增强臂(旋转+M子中心+重排闸门): dataset=$EFF_DATASET range_m=${RANGE_M:-1}"
+      echo "[search] enhanced branch (rotation+M-subcenter+rerank gate): dataset=$EFF_DATASET range_m=${RANGE_M:-1}"
       ;;
     range_hardgate)
       attr_args=(-b "$BASE_ATTR" -a "$RANGE_BIN" -A "$ATTR_DIM" -r)
-      echo "[search] -r 硬闸门 baseline(range): range_bin=$RANGE_BIN"
+      echo "[search] -r hard-gate baseline (range): range_bin=$RANGE_BIN"
       ;;
     inline)
       attr_args=(-b "$BASE_ATTR" -a "$QUERY_ATTR" -A "$ATTR_DIM")
       if [[ "$RERANK" == "1" ]]; then
         attr_args+=(--orig_base "$EXACT_BASE" --orig_query "$EXACT_QUERY")
       fi
-      echo "[search] 属性行间等值过滤(inline): base=$BASE_ATTR query=$QUERY_ATTR  rerank=$RERANK"
+      echo "[search] row-wise attribute equality filtering (inline): base=$BASE_ATTR query=$QUERY_ATTR  rerank=$RERANK"
       ;;
     pure)
-      echo "[search] 未启用属性过滤（纯向量检索）"
+      echo "[search] attribute filtering disabled (pure vector search)"
       ;;
   esac
 
-  # 增强臂 / -r baseline 依赖 range bin 与 range GT
+  # enhanced branch / -r baseline depend on the range bin and range GT
   if [[ "$MODE" == "enhanced" || "$MODE" == "range_hardgate" ]]; then
-    [[ -f "$RANGE_BIN" ]] || { echo "[error] 找不到 range bin $RANGE_BIN，请先运行 encode_range" >&2; exit 1; }
-    [[ -f "$GT_FILE" ]] || { echo "[error] 找不到范围真值 $GT_FILE，请先运行 encode_range" >&2; exit 1; }
+    [[ -f "$RANGE_BIN" ]] || { echo "[error] range bin $RANGE_BIN not found, run encode_range first" >&2; exit 1; }
+    [[ -f "$GT_FILE" ]] || { echo "[error] range groundtruth $GT_FILE not found, run encode_range first" >&2; exit 1; }
   fi
 
   mkdir -p "$(dirname "$LOG_FILE")"
-  : > "$LOG_FILE"   # 每次运行前清空历史结果
+  : > "$LOG_FILE"   # clear previous results before each run
 
   echo "[search] index=$INDEX_FILE query=$SEARCH_QUERY gt=$GT_FILE"
   bash /home/yq/clean-env.sh taskset -c "$SEARCH_AFFINITY" env \
@@ -399,10 +400,10 @@ run_search() {
       "$K" "$EF_SEARCH" symqg "$ROUNDS" "$SEARCH_THREADS" \
       "${attr_args[@]}" "${extra_args[@]}" \
     2>&1 | tee -a "$LOG_FILE"
-  echo "[search] 完成 -> 结果日志: $LOG_FILE"
+  echo "[search] done -> result log: $LOG_FILE"
 }
 
-# ---- 主流程：按 STAGES 顺序执行指定阶段 ----
+# ---- Main flow: execute the requested stages in order ----
 for stage in "${STAGES[@]}"; do
   case "$stage" in
     prepare)      run_prepare ;;
@@ -412,9 +413,9 @@ for stage in "${STAGES[@]}"; do
     encode)       run_encode  ;;
     search)       run_search  ;;
     *)
-      echo "[warn] 未知阶段: $stage （可选: prepare / build / index / encode_range / search）" >&2
+      echo "[warn] unknown stage: $stage (valid: prepare / build / index / encode_range / search)" >&2
       ;;
   esac
 done
 
-echo "[all done] 指定阶段完成。"
+echo "[all done] requested stages complete."

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-range_dataset.py — 范围属性谓词 bin + 范围过滤真值生成器。
+range_dataset.py -- range-attribute predicate bin + range-filter groundtruth generator.
 
-复用已存在的 base_attr（由 base_attr_A{ATTR_DIM}_C{ATTR_CARD}.bin 提供）作为
-数据库属性真值，生成：
-  - query_attr_A*_C*_range.bin : (Nq, 2A) 交错 [lo_a, hi_a] 的 int32 范围谓词
-    （头 A 记为 2A；lo=-1 表示该维不约束）
-  - {ORIG_DATASET}_groundtruth_range_A*_C*.ivecs : 范围过滤真值
-    （base 中属性落入各查询区间 [lo,hi] 内的匹配集，按 L2 距离排序取 top-K）
+Reusing the existing base_attr (provided by base_attr_A{ATTR_DIM}_C{ATTR_CARD}.bin)
+as the database attribute groundtruth, generate:
+  - query_attr_A*_C*_range.bin : (Nq, 2A) interleaved [lo_a, hi_a] int32 range
+    predicates (header A denotes 2A; lo=-1 means this dimension is unconstrained)
+  - {ORIG_DATASET}_groundtruth_range_A*_C*.ivecs : range-filter groundtruth
+    (the set of base points whose attribute falls within each query interval
+    [lo,hi], sorted by L2 distance and truncated to top-K)
 
-与参考库 1.range_dataset.py 的差异：base 属性【不重新随机生成】，直接复用现有
-base_attr，确保与图内核精确闸门、旋转编码使用同一份真值（关键，否则 GT 与
-谓词/编码口径不一致）。
+Difference from reference library 1.range_dataset.py: base attributes are NOT
+regenerated randomly; the existing base_attr is reused directly, ensuring the
+same groundtruth is used by the graph-kernel exact gate and the rotation encoding
+(critical -- otherwise GT and predicate/encoding would be inconsistent).
 """
 import os
 import argparse
@@ -23,21 +25,21 @@ from _dataset_utils import fvecs_read, fvecs_write, ivecs_write, attr_bin_read, 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--src-base', required=True, help='base fvecs 路径（重排/GT 距离用）')
-    ap.add_argument('--src-query', required=True, help='query fvecs 路径')
-    ap.add_argument('--out-dir', required=True, help='输出目录')
-    ap.add_argument('--base-attr-name', required=True, help='已有 base 属性 bin（带头 8 字节头）')
-    ap.add_argument('--query-attr-name', required=True, help='输出 range 谓词 bin 名 (Nq x 2A)')
-    ap.add_argument('--groundtruth-name', required=True, help='输出范围 GT 名')
-    ap.add_argument('--A', type=int, default=1, help='属性数')
-    ap.add_argument('--card', type=int, default=50, help='每属性基数 C -> 选择性 1/card')
+    ap.add_argument('--src-base', required=True, help='base fvecs path (rerank/GT distance)')
+    ap.add_argument('--src-query', required=True, help='query fvecs path')
+    ap.add_argument('--out-dir', required=True, help='output directory')
+    ap.add_argument('--base-attr-name', required=True, help='existing base attribute bin (with 8-byte header)')
+    ap.add_argument('--query-attr-name', required=True, help='output range predicate bin name (Nq x 2A)')
+    ap.add_argument('--groundtruth-name', required=True, help='output range GT name')
+    ap.add_argument('--A', type=int, default=1, help='number of attributes')
+    ap.add_argument('--card', type=int, default=50, help='per-attribute cardinality C -> selectivity 1/card')
     ap.add_argument('--range-w', type=int, default=5,
-                    help='范围覆盖连续类别数 w（clamp 到 [1, card]；w=1 退化为等值）')
-    ap.add_argument('--K', type=int, default=100, help='过滤真值 / Recall@K')
-    ap.add_argument('--n', type=int, default=100000, help='取 base 前 N 行')
-    ap.add_argument('--nq', type=int, default=1000, help='查询数')
-    ap.add_argument('--d', type=int, default=1536, help='向量维度')
-    ap.add_argument('--metric', choices=['ip', 'l2'], default='l2', help='距离度量')
+                    help='range coverage of consecutive categories w (clamped to [1, card]; w=1 degrades to equality)')
+    ap.add_argument('--K', type=int, default=100, help='filter groundtruth / Recall@K')
+    ap.add_argument('--n', type=int, default=100000, help='take first N base rows')
+    ap.add_argument('--nq', type=int, default=1000, help='number of queries')
+    ap.add_argument('--d', type=int, default=1536, help='vector dimension')
+    ap.add_argument('--metric', choices=['ip', 'l2'], default='l2', help='distance metric')
     args = ap.parse_args()
 
     OUT_DIR = args.out_dir
@@ -51,13 +53,14 @@ def main():
     print('      base', X.shape, 'query', Q.shape)
 
     print('[2/3] loading base attributes (reuse existing):', args.base_attr_name)
-    # base_attr 可能是无头纯数据格式：用已知 N/A 自适应判定有无 8 字节头
+    # base_attr may be in headerless raw format: adaptively detect the 8-byte
+    # header using the known N/A.
     attrs = attr_bin_read(os.path.join(OUT_DIR, args.base_attr_name), np.uint32, n=N, a=args.A)  # (N, A)
     assert attrs.shape[0] == N and attrs.shape[1] == args.A, \
-        f'base_attr 形状 {attrs.shape} 与 N={N}, A={args.A} 不一致'
+        f'base_attr shape {attrs.shape} incompatible with N={N}, A={args.A}'
     print('      base attrs', attrs.shape, 'card', args.card)
 
-    # ---------------- query 范围谓词 [lo, hi] ----------------
+    # ---------------- query range predicates [lo, hi] ----------------
     rng_q = np.random.default_rng(2000)
     w = min(max(args.range_w, 1), args.card)
     lo = rng_q.integers(0, args.card - w + 1, size=(Nq, args.A), dtype=np.int64)
@@ -67,7 +70,7 @@ def main():
     attr_bin_write(os.path.join(OUT_DIR, args.query_attr_name), qrange, np.int32)
     print('      query ranges', qrange.shape, 'card', args.card, 'range-w', w)
 
-    # ---------------- 范围过滤真值 ----------------
+    # ---------------- range-filter groundtruth ----------------
     print('[3/3] building range filtered groundtruth (metric=%s) ...' % args.metric)
     G = np.full((Nq, args.K), -1, dtype=np.int32)
     sel = np.zeros(Nq, dtype=np.float64)
@@ -83,7 +86,7 @@ def main():
             order = np.argsort(-score)[:min(args.K, m_idx.size)]
         else:
             diff = X[m_idx] - Q[i]
-            score = np.einsum('ij,ij->i', diff, diff)   # L2²
+            score = np.einsum('ij,ij->i', diff, diff)   # L2^2
             order = np.argsort(score)[:min(args.K, m_idx.size)]
         G[i, :len(order)] = m_idx[order]
     ivecs_write(os.path.join(OUT_DIR, args.groundtruth_name), G)

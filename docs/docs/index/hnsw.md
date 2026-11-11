@@ -10,21 +10,6 @@ degree, and index parameters.
 
 ## Minimal workflow
 
-### Python
-
-Run the [Quick start](../quick_start.md#build-and-search-an-ivf-index) to prepare
-`data` and `queries`, then use those same arrays with HNSW-RaBitQ:
-
-```python
-from rabitqlib import HnswIndex
-
-index = HnswIndex(data.shape[1], M=16, ef_construction=100)  # nbits=7 by default
-index.add(data, num_threads=1)  # trains 16 centroids, then links; 1 thread is reproducible
-ids, distances = index.search(queries, k=10)  # ef defaults to max(k, 64)
-index.save("hnsw.index")
-loaded = HnswIndex.load("hnsw.index")
-```
-
 The first `add` trains an untrained index on the added vectors, as for
 [IVF-RaBitQ](ivf.md#training-centroids-in-python); with fewer rows than
 `num_clusters`, it trains one centroid per row, and `num_clusters` then reports

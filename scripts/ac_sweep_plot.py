@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""读 ac_sweep_results.json，绘制：
- (1) A-sweep (固定 C=10, A=1..4) 三联条形图：QPS@0.9 / Indexing time / max recall；
- (2) A/C 合并对照图：选择率 sel=(1/C)^A → QPS@0.9（log-log）与 → max recall，
-     证明 A 与 C 的影响完全由 selectivity 决定。
-仅绘图，不改任何库代码。"""
+"""Read ac_sweep_results.json and produce:
+ (1) A-sweep (fixed C=10, A=1..4) triple bar chart: QPS@0.9 / Indexing time / max recall;
+ (2) A/C combined comparison: selectivity sel=(1/C)^A -> QPS@0.9 (log-log) and -> max recall,
+     demonstrating that the effect of A and C is fully determined by selectivity.
+This script only plots and never modifies any library code."""
 import json
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-LOG_DIR = "/home/yq/SIGMOD2027/_log"
+LOG_DIR = "./_log"
 data = json.load(open(f"{LOG_DIR}/ac_sweep_results.json"))
 csweep = [d for d in data if d["A"] == 1 and d["C"] != 10]
 asweep = [d for d in data if d["C"] == 10]
@@ -42,7 +42,7 @@ def bar3(axs, cfgs, xticklabels, title_prefix):
     lo = min(mrec) - (max(mrec)-min(mrec))*0.4 - 0.005
     axs[2].set_ylim(max(0.85, lo), 1.005)
 
-# ---- 图1：A-sweep 三联条形图 ----
+# ---- Figure 1: A-sweep triple bar chart ----
 fig1, axs = plt.subplots(1, 3, figsize=(17, 4.8))
 bar3(axs, asweep, [f"A={d['A']}" for d in asweep], "A-sweep (C=10 fixed)")
 fig1.suptitle("A-sweep — effect of attribute count A (C=10 fixed, OpenAI1536 d=1536 N~999k)",
@@ -51,7 +51,7 @@ fig1.tight_layout(rect=[0, 0, 1, 0.94])
 fig1.savefig(f"{LOG_DIR}/ac_sweep_a_hist.png", dpi=140)
 print("saved", f"{LOG_DIR}/ac_sweep_a_hist.png")
 
-# ---- 图2：A/C 合并——选择率决定一切 ----
+# ---- Figure 2: A/C combined -- selectivity governs everything ----
 fig2, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
 def scatter(ax, cfgs, ykey, color, label):
     xs = [d["sel"] for d in cfgs]

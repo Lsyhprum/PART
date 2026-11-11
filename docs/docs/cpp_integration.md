@@ -237,13 +237,6 @@ prefix. The in-tree sample target is `fastscan_example`.
 Index builds require FastScan; requesting `RABITQ_BUILD_INDEX=ON` with FastScan
 disabled fails configuration.
 
-## Python bindings
-
-Python bindings are optional (`RABITQ_BUILD_PYTHON_BINDINGS=ON`) and require indexes. The
-existing `_rabitqlib` extension has a `rabitqlib::python` build-tree alias; build the
-`_rabitqlib` target or install the wheel and use `import rabitqlib`. It is a Python
-MODULE, not a C++ link library, and is not exported as a C++ `find_package` component.
-
 ## Run the C++ tests on Linux
 
 ```bash

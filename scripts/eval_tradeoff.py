@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================
-# eval_tradeoff.py — 汇总各（数据集 × 属性配置 × 量化比特）等值 inline 实验的
-# [RESULT] 日志，生成 qps-recall 权衡曲线与汇总 CSV。
+# eval_tradeoff.py -- Aggregate the [RESULT] logs of equality inline experiments
+# across (dataset x attribute config x quantization bits), and produce
+# qps-recall tradeoff curves and a summary CSV.
 #
-# 日志命名约定（run.sh 产出）：
-#   bit=0 : /home/yq/SIGMOD2027/_log/symqg_{DATASET}_A{ATTR_DIM}_C{ATTR_CARD}_inline.log
-#   bit>0 : /home/yq/SIGMOD2027/_log/symqg_{DATASET}_A{ATTR_DIM}_C{ATTR_CARD}_inline_b{BITS}.log
-# 形如：
+# Log naming convention (produced by run.sh):
+#   bit=0 : {LOG_DIR}/symqg_{DATASET}_A{ATTR_DIM}_C{ATTR_CARD}_inline.log
+#   bit>0 : {LOG_DIR}/symqg_{DATASET}_A{ATTR_DIM}_C{ATTR_CARD}_inline_b{BITS}.log
+# Example line:
 #   [RESULT] algo=symqg param=100 k=100 qps=17998.1 recall=0.156731
 # ============================================================
 import os
@@ -19,16 +20,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-LOG_DIR = os.environ.get("SYMQG_LOG_DIR", "/home/yq/SIGMOD2027/_log")
-FIG_DIR = os.environ.get("SYMQG_FIG_DIR", "/home/yq/SIGMOD2027/_fig/inline_tradeoff")
+LOG_DIR = os.environ.get("SYMQG_LOG_DIR", "./_log")
+FIG_DIR = os.environ.get("SYMQG_FIG_DIR", "./_fig/inline_tradeoff")
 
 RESULT_PAT = re.compile(
     r"\[RESULT\]\s+algo=(\S+)\s+param=(\d+)\s+k=(\d+)\s+qps=([\d.]+)\s+recall=([\d.]+)"
 )
-# 末尾可选 _b{N} 表示量化比特（缺省 0）
+# trailing optional _b{N} denotes quantization bits (default 0)
 FILE_PAT = re.compile(r"symqg_(.+)_A(\d+)_C(\d+)_inline(?:_b(\d+))?\.log$")
 
-# 固定展示顺序
+# fixed display order
 DS_ORDER = ["openai1536", "msmarco", "sift"]
 AC_ORDER = ["A1_C10", "A1_C2", "A2_C10", "A3_C10"]
 
@@ -39,13 +40,13 @@ BIT_LS = {0: "-", 1: "--", 4: "-."}
 
 
 def parse_logs():
-    """返回 {dataset: {ac: {bits: [(ef, qps, recall), ...]}}}，每条按 recall 升序。"""
+    """Return {dataset: {ac: {bits: [(ef, qps, recall), ...]}}}, each sorted by recall ascending."""
     data = {}
     for path in sorted(glob.glob(os.path.join(LOG_DIR, "symqg_*_inline*.log"))):
         fn = os.path.basename(path)
         m = FILE_PAT.search(fn)
         if not m:
-            print(f"[warn] 跳过无法识别的日志: {fn}", file=sys.stderr)
+            print(f"[warn] skipping unrecognized log: {fn}", file=sys.stderr)
             continue
         ds, A, C = m.group(1), m.group(2), m.group(3)
         ac = f"A{A}_C{C}"
@@ -60,11 +61,11 @@ def parse_logs():
                     rec = float(r.group(5))
                     rows.append((ef, qps, rec))
         if not rows:
-            print(f"[warn] 无 [RESULT] 行: {fn}", file=sys.stderr)
+            print(f"[warn] no [RESULT] line in: {fn}", file=sys.stderr)
             continue
         rows.sort(key=lambda x: x[2])
         data.setdefault(ds, {}).setdefault(ac, {})[bits] = rows
-        print(f"[info] {ds} {ac} b{bits}: {len(rows)} 个 (ef,qps,recall) 点")
+        print(f"[info] {ds} {ac} b{bits}: {len(rows)} (ef,qps,recall) points")
     return data
 
 
@@ -81,7 +82,7 @@ def write_csv(data, csv_path):
                 for bits in sorted(data[ds][ac]):
                     for ef, qps, rec in data[ds][ac][bits]:
                         w.writerow([ds, ac, bits, ef, qps, rec])
-    print(f"[csv] 写入 {csv_path}")
+    print(f"[csv] writing {csv_path}")
 
 
 def _plot_curve(ax, rows, color, style, marker, label):
@@ -115,7 +116,7 @@ def plot_per_dataset(data):
 
 
 def plot_bit_compare_per_ac(data):
-    """每 (数据集, 属性配置) 一张图，叠加 bit=0 与 bit=1 曲线，直接对比量化收益。"""
+    """One figure per (dataset, attribute config), overlaying the bit=0 and bit=1 curves to directly compare quantization gains."""
     for ds in DS_ORDER:
         if ds not in data:
             continue
@@ -123,7 +124,7 @@ def plot_bit_compare_per_ac(data):
             if ac not in data[ds]:
                 continue
             if len(data[ds][ac]) < 2:
-                continue  # 仅单档比特则跳过对比图
+                continue  # skip comparison figure when only a single bit level
             fig, ax = plt.subplots(figsize=(7, 5))
             for bits in sorted(data[ds][ac]):
                 _plot_curve(ax, data[ds][ac][bits], DS_COLOR.get(ds, "gray"),
@@ -169,13 +170,13 @@ def main():
     os.makedirs(FIG_DIR, exist_ok=True)
     data = parse_logs()
     if not data:
-        print("[error] 未发现任何有效的 inline 实验日志。", file=sys.stderr)
+        print("[error] no valid inline experiment logs found.", file=sys.stderr)
         sys.exit(1)
     write_csv(data, os.path.join(FIG_DIR, "summary.csv"))
     plot_per_dataset(data)
     plot_bit_compare_per_ac(data)
     plot_combined(data)
-    print("[done] 汇总完成。")
+    print("[done] summary complete.")
 
 
 if __name__ == "__main__":

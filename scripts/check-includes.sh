@@ -45,15 +45,14 @@ if not entries:
     sys.exit("error: no first-party sources in the compilation database")
 
 # Public vendor entry points lack complete IWYU export annotations. Keep their
-# implementation headers out of callers, including PYBIND11_MODULE's provider.
+# implementation headers out of callers (for example, third-party module providers).
 config = json.dumps(
     {
         "Checks": "-*,misc-include-cleaner,readability-duplicate-include",
         "WarningsAsErrors": "misc-include-cleaner,readability-duplicate-include",
         "CheckOptions": {
             "misc-include-cleaner.IgnoreHeaders": "rabitqlib/third/Eigen/src/.*;"
-            "rabitqlib/third/hnswlib/(hnswalg|space_l2)[.]h;"
-            "pybind11/detail/common[.]h"
+            "rabitqlib/third/hnswlib/(hnswalg|space_l2)[.]h"
         },
     }
 )
@@ -155,7 +154,7 @@ for name in sorted(set(files) - {""}):
             jobs.append((file, f"private context {index + 1}", ["--"] + list(flags)))
         continue
     entry = base
-    for prefix in ("python_bindings", "tests", "sample"):
+    for prefix in ("tests", "sample"):
         if name.startswith(prefix + "/"):
             entry = representative(prefix)
             break

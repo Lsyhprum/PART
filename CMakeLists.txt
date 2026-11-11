@@ -14,7 +14,6 @@ option(RABITQ_BUILD_FASTSCAN "Build batch scoring and FastScan SIMD kernels" ON)
 option(RABITQ_BUILD_INDEX "Build ANN indexes and clustering" ON)
 option(RABITQ_BUILD_SAMPLES "Build C++ sample programs" ON)
 option(RABITQ_BUILD_TESTS "Build C++ tests" OFF)
-option(RABITQ_BUILD_PYTHON_BINDINGS "Build Python bindings" OFF)
 option(RABITQ_USE_OPENMP "Use OpenMP for parallel helpers (required by ANN indexes)" ON)
 option(RABITQ_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 # Enable native tuning for local builds; release wheels explicitly set this OFF.
@@ -26,10 +25,6 @@ option(
 
 if(RABITQ_BUILD_INDEX AND NOT RABITQ_BUILD_FASTSCAN)
     message(FATAL_ERROR "RABITQ_BUILD_INDEX requires RABITQ_BUILD_FASTSCAN=ON")
-endif()
-
-if(RABITQ_BUILD_PYTHON_BINDINGS AND NOT RABITQ_BUILD_INDEX)
-    message(FATAL_ERROR "RABITQ_BUILD_PYTHON_BINDINGS requires RABITQ_BUILD_INDEX=ON")
 endif()
 
 if(RABITQ_BUILD_INDEX AND NOT RABITQ_USE_OPENMP)
@@ -343,10 +338,6 @@ endif()
 
 if(RABITQ_BUILD_SAMPLES)
     add_subdirectory(sample/cpp)
-endif()
-
-if(RABITQ_BUILD_PYTHON_BINDINGS)
-    add_subdirectory(python_bindings)
 endif()
 
 if(RABITQ_BUILD_TESTS)

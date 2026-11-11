@@ -5,11 +5,11 @@ centroid means from the original float32 data, accumulate in float64, and requir
 no external clustering package. Choose the class explicitly; neither switches
 algorithms based on the cluster count.
 
-For installation, see [Quick start](quick_start.md#install).
+For building the library, see [C++ integration](cpp_integration.md).
 
 You do not need these classes to build an index: `IvfIndex.train` and
 `HnswIndex.train`, or the first `add`, run them for you (see
-[IVF-RaBitQ training](index/ivf.md#training-centroids-in-python)). Use them
+[IVF-RaBitQ training](index/ivf.md#training-centroids)). Use them
 directly to inspect assignments, reuse one clustering across several indexes,
 or pass the result to `set_centroids` and `add(..., cluster_ids=...)`. The
 indexes train with their own defaults, including sampling at most 256 vectors
@@ -21,29 +21,6 @@ per centroid; the classes below default to training on every vector.
 | --- | --- | --- | --- |
 | [RaBitQKMeans](#rabitqkmeans) | Flat RaBitQ scan | Small cluster counts | `n >= k >= 1` |
 | [QGKMeans](#qgkmeans) | SymphonyQG centroid graph | Larger cluster counts | `n >= k > graph_degree` (default 32) |
-
-## Python
-
-Both classes have the same training and result interface:
-
-```python
-from rabitqlib import QGKMeans, RaBitQKMeans
-
-kmeans = RaBitQKMeans(d, 16, niter=25, num_threads=8)
-# For larger cluster counts, use instead:
-# kmeans = QGKMeans(d, 4096, niter=25, num_threads=8)
-last_iteration_obj = kmeans.train(x)
-
-centroids = kmeans.centroids      # shape (k, d)
-assignments = kmeans.assignments  # shape (n,)
-distances = kmeans.distances      # shape (n,)
-final_obj = kmeans.final_obj
-
-# Assign other vectors, shape (m, d), to the trained centroids.
-query_assignments, query_distances = kmeans.assign(queries)  # shapes (m,), (m,)
-```
-
-`x` has shape `(n, d)` and is converted to a C-contiguous float32 array.
 
 ## C++
 
@@ -89,7 +66,7 @@ Append `ip` for spherical clustering of normalized input; the default is `l2`.
 
 ## Parameters and input
 
-Set Python keyword arguments or fields of the corresponding C++ parameter type:
+Set the fields of the corresponding C++ parameter type:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -139,7 +116,7 @@ before this parameter existed. The selected vectors depend on the
 C++ standard library's random distributions, so the same seed can choose a
 different sample on another platform.
 
-`obj` and `iteration_stats` (and the value returned by Python `train()`) are
+`obj` and `iteration_stats`  are
 computed on the sampled vectors, while `distances` and `final_obj` cover all `n`
 vectors. Their values are not directly comparable. Validation still checks
 every input vector, including those outside the sample.
@@ -185,14 +162,14 @@ use [`assign`](#assign-new-vectors).
 
 ## Results and final assignment
 
-Python result properties are `None` until a successful fit; a failed fit
+Result properties are unset until a successful fit; a failed fit
 preserves the previous successful results.
 
 `distances` contains distances to the returned **assigned** centroids, computed
 from the original float32 vectors and centroids. For squared L2, `final_obj` is
 their sum (WCSS); spherical mode sums `1 - inner_product`. `obj` and
-`iteration_stats` record objectives before each centroid update; Python
-`train()` returns the last such objective.
+`iteration_stats` record objectives before each centroid update; the
+returned objective is the last such objective.
 
 `FinalAssignmentMode.Approximate` (default) uses the selected class's assignment
 algorithm. The legacy name `FinalAssignmentMode.SymphonyQG` remains an alias for
@@ -203,13 +180,6 @@ closer. After sampling, most points have no such label, so every point uses the
 same graph search. Approximate training objectives need not decrease monotonically.
 
 To require exact nearest-centroid **final** assignments with either class:
-
-```python
-from rabitqlib import FinalAssignmentMode, RaBitQKMeans
-
-kmeans = RaBitQKMeans(d, 16, final_assignment=FinalAssignmentMode.Exact)
-kmeans.train(x)
-```
 
 In C++, set `parameters.final_assignment` to
 `rabitqlib::rabitqkmeans::FinalAssignmentMode::Exact` or
@@ -245,33 +215,3 @@ sampled the input, because the sampled final pass is the same assignment.
 Unsampled approximate QGKMeans training also uses previous labels as graph
 search hints, so its final labels can differ.
 
-## Compare with Faiss
-
-The [comparison script](https://github.com/VectorDB-NTU/RaBitQ-Library/blob/main/sample/python/compare_with_faiss.py)
-compares both methods with FAISS and requires `faiss-cpu`. Defaults are one
-million 500-dimensional vectors, 4,000 centroids, and up to 25 iterations.
-Load data with `--input data.npy`, or `--input data.bin --d D` for raw row-major
-float32 data. Choose a thread count within the available hardware limit.
-
-```bash
-python sample/python/compare_with_faiss.py --threads 48
-```
-
-All three methods receive the same full dataset, iteration limit, cluster count,
-thread budget, and seed values; FAISS subsampling is disabled. This command runs
-one fit per method with seed 42. Add `--repeats 4` for four fits per method with
-rotating order, or `--num-seeds N` to use consecutive seeds. Different initializers
-mean identical seeds need not produce identical centroids.
-
-Only `train()` is timed, including the library methods' default approximate
-final assignment. The script reports actual iterations, timing medians/ranges,
-exhaustive nearest-centroid objectives, and both library methods' returned-label
-objectives and label mismatches. Equal-distance ties can produce mismatches
-without changing the objective. `--spherical` normalizes the input copy and
-compares sums of `1 - inner_product`.
-
-Separate worker processes isolate OpenMP runtimes and share a temporary float32
-input file; allow about `4 * n * d` bytes of temporary disk space. Input staging,
-process startup, and exhaustive evaluation are outside training time. For Linux
-CPU placement, set `OMP_PLACES=threads OMP_PROC_BIND=close`; on NUMA systems,
-use `numactl --cpunodebind=0 --membind=0` with a thread count that fits the node.

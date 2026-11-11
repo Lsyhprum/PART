@@ -207,7 +207,7 @@ def ivecs_read(fname):
 
 
 #######################################################
-# Attribute rotation encoding (disjoint rotation)
+# Attribute CPR encoding (disjoint rotation)
 #######################################################
 
 def _rotated(x, angles):
@@ -231,7 +231,7 @@ def _rotated(x, angles):
     return out[0] if single else out
 
 
-def _hash_to_phases(ids, d, seed):
+def _hash_to_phases_cpr(ids, d, seed):
     """Hash each attribute ID into (d//2) phases in [0,2π). A phase depends only on the
     value itself + seed, independent of other values in the dataset -> the data side and
     query side must produce the same phase for the same value (critical, otherwise the
@@ -248,7 +248,7 @@ def _hash_to_phases(ids, d, seed):
     return out
 
 
-def block_split(A, P, scheme="contiguous"):
+def cpr_block_split(A, P, scheme="contiguous"):
     """Split P dimension pairs evenly across A attributes, non-overlapping.
     scheme='contiguous': contiguous split (default, cache/vectorization friendly).
     Returns list[length A], each item an np.ndarray of block dimension-pair indices."""
@@ -263,7 +263,7 @@ def block_split(A, P, scheme="contiguous"):
     raise ValueError(f"unknown block scheme: {scheme}")
 
 
-def encode_disjoint(base, attrs_cat, blocks, seeds):
+def encode_cpr(base, attrs_cat, blocks, seeds):
     """Disjoint-block categorical encoding.
     attrs_cat: (N, A) int; blocks[a] is the array of dimension-pair indices occupied by attribute a;
     seeds[a] is the per-attribute salt. Each attribute block applies an independent hash rotation ->
@@ -272,7 +272,7 @@ def encode_disjoint(base, attrs_cat, blocks, seeds):
     P = base.shape[1] // 2
     E = base.copy()
     for a in range(attrs_cat.shape[1]):
-        full = _hash_to_phases(attrs_cat[:, a], base.shape[1], seeds[a])   # (N, P)
+        full = _hash_to_phases_cpr(attrs_cat[:, a], base.shape[1], seeds[a])   # (N, P)
         ang = np.zeros((full.shape[0], P), dtype=np.float64)
         ang[:, blocks[a]] = full[:, blocks[a]]
         E = _rotated(E, ang)

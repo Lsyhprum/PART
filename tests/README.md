@@ -1,12 +1,11 @@
 # RaBitQ Tests
 
-This directory contains the C++ unit and integration tests and the Python
-binding tests for RaBitQ Library.
+This directory contains the C++ unit and integration tests for RaBitQ Library.
 
 Persistence tests include [frozen release-produced indexes](fixtures/persistence/README.md)
-and search results, in addition to current round trips. C++ and installed-wheel
-tests load the same fixtures, compare search results, and verify save/load migration
-and rejection of truncated or unsupported formats.
+and search results, in addition to current round trips. C++ tests load the same
+fixtures, compare search results, and verify save/load migration and rejection of
+truncated or unsupported formats.
 
 ## Prerequisites
 
@@ -23,7 +22,7 @@ This is a tested development toolchain, not a new minimum compiler requirement;
 see [compiler and tool versions](../docs/development.md#compiler-and-tool-versions).
 
 OpenMP is optional for core/FastScan tests: configure `RABITQ_BUILD_INDEX=OFF` and
-`RABITQ_USE_OPENMP=OFF`. ANN/Python testing retains the full prerequisites above.
+`RABITQ_USE_OPENMP=OFF`. ANN testing retains the full prerequisites above.
 
 On Windows, install Visual Studio 2026 with the Desktop development with C++
 workload. Use MSVC for all C++ targets, including SIMD kernels.
@@ -144,37 +143,6 @@ APIs. Repaired-wheel jobs run the full core Python suite. Large-dimension Python
 cases check representative binding/persistence paths; C++ covers each clustering
 dimension and storage layout.
 
-## Python tests
-
-Use an activated [project environment](../.github/CONTRIBUTING.md#python-environment).
-Rebuild and install the extension before testing C++ changes. These commands
-work in PowerShell and Bash:
-
-```text
-python -m pip install ".[test]" -Ccmake.define.RABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF
-python -c "import rabitqlib._rabitqlib as ext; print(ext.__file__)"
-python -m pytest tests/python -ra -q
-```
-
-Confirm the printed extension path belongs to the intended environment. The
-suite includes all three indexes, quantization, persistence, and Unicode paths.
-
-The [Python example tests](python/test_examples.py) cover RaBitQKMeans and
-QGKMeans clustering, L2/IP indexing, saved cluster files, and queries without
-importing FAISS. The [FAISS comparison tests](python/test_compare_with_faiss.py)
-cover both clustering methods and skip FAISS-dependent cases when `faiss-cpu`
-is absent. CI runs them in the Linux Python 3.11 source-install job, whose result
-feeds `Python validation`; wheel tests do not install FAISS.
-
-The [C++ clustering example tests](python/test_cpp_clustering_examples.py) check
-saved vectors, exact labels, and compatibility with the C++ index builders.
-The Ubuntu C++ job runs them against its sample binaries, with
-`RABITQ_REQUIRE_CPP_EXAMPLES=1` so missing executables fail. Wheel jobs exclude
-these tests. With both `RABITQ_BUILD_TESTS=ON` and `RABITQ_BUILD_SAMPLES=ON`, the build
-also provides `cpp_example_index_check`, which loads each CLI-produced index and
-checks its metadata and self-query results without requiring Python bindings.
-Locally, build both the examples and this checker first; missing executables otherwise skip.
-
 ## Installed CMake package test
 
 After building the library, verify that another project can consume its installed
@@ -291,8 +259,6 @@ See [the fixture policy](fixtures/core_api_v1/README.md).
 - `allocation/`, `dispatch/`, `failures/`, `integration/`: separate C++ executables for
   no-allocation, dispatch/static-initialization, allocation-failure and CLI-index checks
 - `fixtures/`: frozen core API and persistence compatibility fixtures
-- `python/`: Python binding tests and persistence fixtures
-- `test_mypy.py`, `test_pyright.py`: static type checks of the installed package
 - `consumer/`: installed CMake package test
 - `core_consumer/`: external core/FastScan consumer runner and the core static-initialization test
 
@@ -336,33 +302,4 @@ these under ASan/UBSan as well as Release; do not disable allocator-mismatch che
 `compact_codes_failure_test` covers cold scratch allocation and growth failures in
 serial and OpenMP encoding, including the public FastScan batch entry points.
 
-## Python editor support
 
-Wheels include type stubs and `py.typed`; select the installed environment in your editor.
-Keep [public declarations](../python_bindings/__init__.pyi) and runtime docstrings in sync,
-following the [numpydoc style](https://numpydoc.readthedocs.io/en/latest/format.html).
-Array shapes and value ranges remain runtime checks.
-
-After rebuilding and installing with the `test` extra, run:
-
-```bash
-python -m pytest tests/python/test_editor_support.py tests/test_mypy.py -q
-```
-
-The suite checks installed declarations, signatures, documentation, examples, and
-runtime metadata on every wheel. Strict mypy valid/invalid-call checks live in
-`tests/test_mypy.py`, run for source installs on pushes and for each Linux x86-64
-wheel ABI that CI builds (3.11 and 3.14 on pull requests). Other wheel platforms
-do not repeat static analysis. CI requires mypy for these selected checks; missing mypy fails the test. Keep its pins in the
-`test` extra and Linux x86-64 wheel override synchronized.
-Benchmark protocol tests run in Python quality CI, separately from wheel tests.
-
-CI also checks the public type examples and test code with Pyright. With Node 24
-and the `test,typing` extras installed in the same environment, run:
-
-```bash
-python -m pytest tests/test_pyright.py -q
-```
-
-This requires clean diagnostics and verifies that every intentional invalid call
-is rejected. Pyright is not required for the platform wheel test suite.

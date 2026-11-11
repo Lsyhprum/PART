@@ -109,7 +109,7 @@ endforeach()
 
 if(RABITQ_BUILD_INDEX)
     if(RABITQ_BUILD_SAMPLES)
-        # The Python CLI integration test validates indexes without Python bindings.
+        # The C++ CLI integration test validates built indexes.
         add_executable(cpp_example_index_check integration/cpp_example_index_check.cpp)
         target_link_libraries(cpp_example_index_check PRIVATE rabitqlib::index)
         rabitq_configure_target(cpp_example_index_check)
