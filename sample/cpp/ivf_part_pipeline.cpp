@@ -59,7 +59,7 @@ void usage(const char* program) {
         "Usage: %s --base F --query F --base-attr F --query-attr F --dim D "
         "--attr-dim A [--salt-file F | --standalone-seed N] [options]\n"
         "Build a rotated IVF-RaBitQ index in one process (no clustering files).\n"
-        "  --encoder apr|cpr       rotation protocol (default: apr)\n"
+        "  --encoder apr|cpr|hapr|spr  rotation protocol (default: apr)\n"
         "  --out-dir DIR           output directory (default: .)\n"
         "  --index-out NAME        index file name (default: part_ivf.index)\n"
         "  --query-out NAME        rotated query file name (default: part_query.fvecs)\n"
@@ -190,12 +190,16 @@ PipelineArgs parse_args(int argc, char* argv[]) {
         enc.kind = EncoderKind::kApr;
     } else if (encoder_text == "cpr") {
         enc.kind = EncoderKind::kCpr;
+    } else if (encoder_text == "hapr") {
+        enc.kind = EncoderKind::kHapr;
+    } else if (encoder_text == "spr") {
+        enc.kind = EncoderKind::kSpr;
     } else {
-        throw std::invalid_argument("--encoder must be apr or cpr");
+        throw std::invalid_argument("--encoder must be apr, cpr, hapr or spr");
     }
     if (enc.kind == EncoderKind::kCpr && (result.layout_explicit || range_l != 0.0)) {
         throw std::invalid_argument(
-            "--layout / --range-l are only supported by --encoder apr"
+            "--layout / --range-l are not supported by --encoder cpr"
         );
     }
     if (result.metric_text != "l2" && result.metric_text != "ip") {
@@ -227,14 +231,27 @@ PipelineArgs parse_args(int argc, char* argv[]) {
             return kind == rabitqlib::attribute::AttributeKind::kRange;
         }
     );
+    // Apply encoder-specific layout overrides before the range-l consistency
+    // check: CPR clears the layout, SPR forces the all-range layout.
+    if (enc.kind == EncoderKind::kCpr) {
+        enc.layout.clear();
+        enc.hapr = false;
+    } else if (enc.kind == EncoderKind::kSpr) {
+        // SPR fixes the layout to all-range; --layout is rejected above.
+        if (result.layout_explicit) {
+            throw std::invalid_argument(
+                "--layout is not supported by --encoder spr"
+            );
+        }
+        enc.layout = std::vector<rabitqlib::attribute::AttributeKind>(
+            enc.attr_dim, rabitqlib::attribute::AttributeKind::kRange
+        );
+        enc.hapr = true;
+    }
     if (!enc.hapr && range_l != 0.0) {
         throw std::invalid_argument(
             "--range-l requires a --layout containing at least one range token"
         );
-    }
-    if (enc.kind == EncoderKind::kCpr) {
-        enc.layout.clear();
-        enc.hapr = false;
     }
     return result;
 }
@@ -269,7 +286,7 @@ void run_smoke(
     std::vector<PID> ids(query.rows * k, rabitqlib::kPidMax);
     std::vector<float> distances(query.rows * k, 0.0F);
     const auto start = Clock::now();
-    if (args.layout_explicit) {
+    if (ctx.hapr) {
         index.search_batch(
             query.data(), query.rows, k, nprobe, ids.data(), distances.data(),
             ctx.base_attrs.data(), ctx.query_attrs.data(), args.encoding.attr_dim,
@@ -287,7 +304,7 @@ void run_smoke(
     size_t correct = 0;
     size_t violations = 0;
     const rabitqlib::attribute::AttributeKind* layout =
-        args.layout_explicit ? ctx.layout_ptr() : nullptr;
+        ctx.hapr ? ctx.layout_ptr() : nullptr;
     for (size_t z = 0; z < query.rows; ++z) {
         for (size_t y = 0; y < k; ++y) {
             const PID id = ids[z * k + y];
@@ -334,11 +351,18 @@ int run(int argc, char* argv[]) {
     part_sample::AttributeMatrix<float> query =
         part_sample::load_vectors(enc.query.c_str(), enc.dim, ctx.query_attrs.rows);
 
+    const char* encoder_name = nullptr;
+    switch (enc.kind) {
+        case EncoderKind::kApr:  encoder_name = "apr";  break;
+        case EncoderKind::kCpr:  encoder_name = "cpr";  break;
+        case EncoderKind::kHapr: encoder_name = "hapr"; break;
+        case EncoderKind::kSpr:  encoder_name = "spr";  break;
+    }
     std::fprintf(
         stderr,
         "[pipeline] encoder=%s dim=%zu attr_dim=%zu n=%zu nq=%zu clusters=%zu "
         "bits=%zu metric=%s\n",
-        enc.kind == EncoderKind::kApr ? "apr" : "cpr", enc.dim, enc.attr_dim,
+        encoder_name, enc.dim, enc.attr_dim,
         base.rows, query.rows, args.num_clusters, args.bits,
         args.metric_text.c_str()
     );

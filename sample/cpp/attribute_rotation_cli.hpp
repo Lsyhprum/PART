@@ -36,7 +36,7 @@ using rabitqlib::attribute::read_attr_bin;
 using rabitqlib::attribute::read_salt_file;
 using rabitqlib::attribute::write_fvecs;
 
-enum class EncoderKind { kApr, kCpr };
+enum class EncoderKind { kApr, kCpr, kHapr, kSpr };
 
 struct Args {
     std::string base;
@@ -65,9 +65,15 @@ inline void set_defaults(Args& args, EncoderKind kind) {
     if (kind == EncoderKind::kApr) {
         args.base_out = "apr_base.fvecs";
         args.query_out = "apr_query.fvecs";
-    } else {
+    } else if (kind == EncoderKind::kCpr) {
         args.base_out = "cpr_base.fvecs";
         args.query_out = "cpr_query.fvecs";
+    } else if (kind == EncoderKind::kHapr) {
+        args.base_out = "hapr_base.fvecs";
+        args.query_out = "hapr_query.fvecs";
+    } else {
+        args.base_out = "spr_base.fvecs";
+        args.query_out = "spr_query.fvecs";
     }
 }
 
@@ -191,6 +197,9 @@ inline Args parse_args(int argc, char* argv[], EncoderKind kind) {
             if (kind == EncoderKind::kCpr) {
                 throw std::invalid_argument("Unknown option: " + option);
             }
+            if (kind == EncoderKind::kSpr && option == "--layout") {
+                throw std::invalid_argument("Unknown option: " + option);
+            }
             if (option == "--layout") {
                 args.layout_text = value;
             } else if (option == "--range-l") {
@@ -227,7 +236,17 @@ inline Args parse_args(int argc, char* argv[], EncoderKind kind) {
         );
     }
 
-    if (kind == EncoderKind::kApr) {
+    if (kind == EncoderKind::kCpr) {
+        // CPR has no layout; every column is an equality column.
+    } else if (kind == EncoderKind::kSpr) {
+        // SPR fixes the layout to all-range; --layout is rejected earlier.
+        args.layout = std::vector<AttributeKind>(
+            args.attr_dim, AttributeKind::kRange
+        );
+        args.hapr = true;
+    } else {
+        // kApr and kHapr share the layout machinery; kHapr is the explicit
+        // name for the mixed/range path, kApr keeps the original behaviour.
         args.layout = args.layout_text.empty()
                           ? std::vector<AttributeKind>(
                                 args.attr_dim, AttributeKind::kEquality
@@ -397,6 +416,16 @@ inline RotationContext prepare_rotation(const Args& args) {
             }
             return AprRotationPlan::make_cpr(config, salt.data(), salt.size());
         }
+        if (args.kind == EncoderKind::kSpr) {
+            if (args.use_standalone) {
+                return AprRotationPlan::make_spr_standalone(
+                    config, args.standalone_seed, ctx.range_l
+                );
+            }
+            return AprRotationPlan::make_spr(
+                config, salt.data(), salt.size(), ctx.range_l
+            );
+        }
         if (ctx.hapr) {
             if (args.use_standalone) {
                 return AprRotationPlan::make_hapr_standalone(
@@ -419,9 +448,10 @@ inline RotationContext prepare_rotation(const Args& args) {
     if (ctx.hapr) {
         ctx.base_values = expand_base_values(ctx.base_attrs, ctx.layout);
         ctx.query_values = expand_query_values(ctx.query_attrs, ctx.layout);
+        const char* tag = args.kind == EncoderKind::kSpr ? "spr" : "hapr";
         std::fprintf(
-            stderr, "[hapr] layout=%s range_l=%.6g qstride=%zu dim=%zu attr_dim=%zu\n",
-            args.layout_text.c_str(), ctx.range_l, ctx.qstride, args.dim, args.attr_dim
+            stderr, "[%s] layout=%s range_l=%.6g qstride=%zu dim=%zu attr_dim=%zu\n",
+            tag, args.layout_text.c_str(), ctx.range_l, ctx.qstride, args.dim, args.attr_dim
         );
     }
     return ctx;
@@ -470,6 +500,14 @@ inline void rotate_vectors(
                 args.threads
             );
         }
+        return;
+    }
+    if (args.kind == EncoderKind::kSpr) {
+        const double* values =
+            is_base ? ctx.base_values.data() : ctx.query_values.data();
+        rabitqlib::attribute::rotate_batch_spr(
+            ctx.rotation(), data, vectors.rows, values, data, args.threads
+        );
         return;
     }
     if (ctx.hapr) {

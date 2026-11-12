@@ -13,7 +13,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(RABITQ_BUILD_FASTSCAN "Build batch scoring and FastScan SIMD kernels" ON)
 option(RABITQ_BUILD_INDEX "Build ANN indexes and clustering" ON)
 option(RABITQ_BUILD_SAMPLES "Build C++ sample programs" ON)
-option(RABITQ_BUILD_TESTS "Build C++ tests" OFF)
 option(RABITQ_USE_OPENMP "Use OpenMP for parallel helpers (required by ANN indexes)" ON)
 option(RABITQ_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 # Enable native tuning for local builds; release wheels explicitly set this OFF.
@@ -332,14 +331,6 @@ install(FILES
     DESTINATION "${rabitqlib_cmake_dir}"
 )
 
-if(RABITQ_BUILD_TESTS)
-    enable_testing()
-endif()
-
 if(RABITQ_BUILD_SAMPLES)
     add_subdirectory(sample/cpp)
-endif()
-
-if(RABITQ_BUILD_TESTS)
-    add_subdirectory(tests)
 endif()

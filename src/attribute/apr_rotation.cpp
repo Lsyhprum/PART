@@ -740,4 +740,78 @@ void rotate_vector_cpr(
     rotate_batch_cpr(plan, src, 1, attrs, dst, 0);
 }
 
+// ---------------------------------------------------------------------------
+// SPR (scaled-phase rotation) — the pure-range specialisation of HAPR.
+//
+// Mathematically SPR == a HAPR plan whose every column is a range column, so we
+// reuse the validated HAPR construction and the scaled-phase rotation kernel
+// (compute_entry_hapr) directly. The only additions are the all-range layout
+// and a forced range predicate, so callers cannot accidentally build an
+// equality-only "SPR" plan. The salt generation matches make_hapr_standalone
+// (>> 1) rather than CPR, keeping SPR byte-compatible with HAPR for the same
+// seed.
+// ---------------------------------------------------------------------------
+AprRotationPlan AprRotationPlan::make_spr(
+    const AprConfig& config,
+    const uint64_t* salt,
+    size_t salt_len,
+    double range_l
+) {
+    AprConfig spr_config = config;
+    spr_config.predicate = PredicateKind::kRange;
+    validate_config(spr_config);
+    if (salt == nullptr) {
+        throw std::invalid_argument("SPR salt must not be null");
+    }
+    const size_t expected = checked_mul(config.attr_dim, config.dim / 2);
+    if (salt_len != expected) {
+        throw std::invalid_argument("SPR salt length must equal attr_dim * (dim / 2)");
+    }
+    std::vector<AttributeKind> layout(config.attr_dim, AttributeKind::kRange);
+    const bool has_range =
+        validate_hapr_layout(spr_config, layout.data(), layout.size(), range_l);
+    return AprRotationPlan(
+        spr_config,
+        std::vector<uint64_t>(salt, salt + salt_len),
+        std::move(layout),
+        has_range,
+        range_l
+    );
+}
+
+AprRotationPlan AprRotationPlan::make_spr_standalone(
+    const AprConfig& config, uint64_t seed, double range_l
+) {
+    AprConfig spr_config = config;
+    spr_config.predicate = PredicateKind::kRange;
+    validate_config(spr_config);
+    std::vector<AttributeKind> layout(config.attr_dim, AttributeKind::kRange);
+    const bool has_range =
+        validate_hapr_layout(spr_config, layout.data(), layout.size(), range_l);
+    const size_t count = checked_mul(config.attr_dim, config.dim / 2);
+    std::vector<uint64_t> salt(count);
+    uint64_t state = seed;
+    for (size_t i = 0; i < count; ++i) {
+        salt[i] = splitmix64_next(state) >> 1;
+    }
+    return AprRotationPlan(spr_config, std::move(salt), std::move(layout), has_range, range_l);
+}
+
+void rotate_batch_spr(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const double* values,
+    float* dst,
+    size_t num_threads
+) {
+    rotate_batch_hapr(plan, src, rows, values, dst, num_threads);
+}
+
+void rotate_vector_spr(
+    const AprRotationPlan& plan, const float* src, const double* values, float* dst
+) {
+    rotate_batch_spr(plan, src, 1, values, dst, 0);
+}
+
 }  // namespace rabitqlib::attribute

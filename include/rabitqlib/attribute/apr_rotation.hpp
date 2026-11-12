@@ -56,6 +56,20 @@ class AprRotationPlan {
     );
     static AprRotationPlan make_cpr_standalone(const AprConfig& config, uint64_t seed);
 
+    // SPR (scaled-phase rotation) factories — the pure-range specialisation of
+    // HAPR from the PART paper (Algorithm III). Every column is a numeric range
+    // column, so the plan layout is entirely AttributeKind::kRange and the
+    // shared salt contract (attr_dim blocks of dim/2 uint64) is unchanged.
+    static AprRotationPlan make_spr(
+        const AprConfig& config,
+        const uint64_t* salt,
+        size_t salt_len,
+        double range_l
+    );
+    static AprRotationPlan make_spr_standalone(
+        const AprConfig& config, uint64_t seed, double range_l
+    );
+
     [[nodiscard]] size_t dim() const { return config_.dim; }
     [[nodiscard]] size_t attr_dim() const { return config_.attr_dim; }
     [[nodiscard]] size_t pair_dim() const { return pair_dim_; }
@@ -159,6 +173,23 @@ void rotate_vector_cpr(
 );
 void rotate_vector_cpr(
     const AprRotationPlan& plan, const float* src, const int32_t* attrs, float* dst
+);
+
+// SPR (scaled-phase rotation) entry point. Identical signature to the HAPR
+// entry point: range columns carry the numeric value (base) or the interval
+// centre (query). The rotation reuses compute_entry_hapr's scaled phase, so an
+// SPR plan (all-range layout) is byte-identical to a HAPR plan with the same
+// all-range layout and the same salt.
+void rotate_vector_spr(
+    const AprRotationPlan& plan, const float* src, const double* values, float* dst
+);
+void rotate_batch_spr(
+    const AprRotationPlan& plan,
+    const float* src,
+    size_t rows,
+    const double* values,
+    float* dst,
+    size_t num_threads = 0
 );
 
 }  // namespace rabitqlib::attribute
